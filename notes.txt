@@ -1,0 +1,8 @@
+We can create a frontend (mobile app) use a socket structure to a backend server to both test the 
+actual speed and get model weights or get the pc to train the "LSTM" for us,
+maybe we can deploy a network in mobile, tensorrt, ncnn but idk if LSTMs or even training works there.
+Upon pre-existing embedded personas and adding our own (2 person dataset lmao) we can maybe go to the presentation?
+For the mobile app we would need to have a compare real-data vs prediction system.
+
+Can we do a hybrid of publicly available datasets to maybe at least pretrain the data.
+Cleanup on the dashboard is now a necessity.

@@ -23,6 +23,12 @@ from src.performance_evaluator import (
     run_multi_seed, plot_multi_seed_bars, plot_multi_seed_distribution,
     compute_win_rates,
 )
+from src.persona_generator import PERSONAS, PersonaDataGenerator
+try:
+    from src.personal_model import PersonalTrainer, CrossUserEvaluator
+    _TORCH_OK = True
+except ImportError:
+    _TORCH_OK = False
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -63,7 +69,10 @@ st.markdown("""
 
 # ── Session state defaults ────────────────────────────────────────────────────
 for key in ['dataset', 'classifier', 'ts', 'sim_rule', 'sim_th', 'sim_ml', 'ml_preds',
-            'multi_seed_df', 'multi_seed_n', 'multi_seed_dur']:
+            'multi_seed_df', 'multi_seed_n', 'multi_seed_dur',
+            'persona_datasets', 'cross_user_results',
+            'persona_trainer', 'persona_ts', 'persona_sim_rule',
+            'persona_sim_th', 'persona_sim_ml', 'persona_ml_preds']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -128,6 +137,7 @@ tabs = st.tabs([
     "🤖 ML Training",
     "▶️ Streaming",
     "📈 Comparison",
+    "👤 Persona AI",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -625,3 +635,269 @@ with tabs[4]:
 
             with st.expander("Per-run raw metrics"):
                 st.dataframe(df_runs, use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 5 — Persona AI
+# ─────────────────────────────────────────────────────────────────────────────
+with tabs[5]:
+    st.header("Persona AI — Per-User LSTM Training")
+
+    if not _TORCH_OK:
+        st.error("PyTorch is not installed. Run `pip install torch` then restart.")
+        st.stop()
+
+    st.markdown("""
+    Each user persona has three spatial anchors (home, work, commute corridor) with
+    distinct RF and cell-load profiles.  Network metrics are generated from a
+    physically motivated capacity model — **congestion labels emerge from the physics**,
+    not from pre-assigned class distributions.
+
+    The **cross-user experiment** is the empirical proof: for each persona, a model
+    trained only on *that user's* data is compared against a model trained on all
+    *other* users' data, both evaluated on the same held-out test set.
+    """)
+
+    st.divider()
+
+    # ── Step 1: generate per-user data ───────────────────────────────────────
+    st.subheader("1 · Generate Per-User Datasets")
+
+    col_ns, col_dur, col_seed = st.columns(3)
+    with col_ns:
+        p_n_sessions = st.slider("Sessions per user", 5, 40, 15, 5,
+                                 help="Each session = one continuous streaming period.")
+    with col_dur:
+        p_duration = st.slider("Session duration (s)", 120, 600, 300, 60)
+    with col_seed:
+        p_seed = st.number_input("Data seed", 0, 9999, 0, key="p_seed")
+
+    if st.button("Generate Persona Datasets", type="primary"):
+        gen = PersonaDataGenerator()
+        with st.spinner("Generating per-user traces …"):
+            st.session_state.persona_datasets = gen.generate_all_personas(
+                n_sessions=p_n_sessions,
+                session_duration=p_duration,
+                seed=int(p_seed),
+            )
+            st.session_state.cross_user_results = None  # invalidate old results
+            st.session_state.persona_trainer = None
+        n_rows = sum(len(d) for d in st.session_state.persona_datasets.values())
+        st.success(f"Generated {n_rows:,} total rows across {len(PERSONAS)} users.")
+
+    if st.session_state.persona_datasets is not None:
+        pds = st.session_state.persona_datasets
+
+        # Distribution comparison
+        st.subheader("Feature Distributions by Persona")
+        feat_p = st.selectbox(
+            "Feature", FEATURES, key="p_feat_sel",
+            format_func=lambda f: f.replace('_', ' ').title(),
+        )
+        combined = pd.concat(
+            [df.assign(persona_name=PERSONAS[k].name) for k, df in pds.items()],
+            ignore_index=True,
+        )
+        fig_dist = px.histogram(
+            combined, x=feat_p, color='persona_name', barmode='overlay',
+            opacity=0.65, nbins=60,
+            labels={feat_p: feat_p.replace('_', ' ').title()},
+            title=f"Distribution of {feat_p.replace('_', ' ')} across all personas",
+        )
+        fig_dist.update_layout(height=360, legend_title='Persona')
+        st.plotly_chart(fig_dist, use_container_width=True)
+
+        # Congestion class breakdown per persona
+        st.subheader("Congestion Class Breakdown per Persona")
+        class_rows = []
+        for k, df in pds.items():
+            counts = df['congestion_true'].value_counts(normalize=True)
+            class_rows.append({
+                'Persona': PERSONAS[k].name,
+                'Low (%)':    round(counts.get('low',    0) * 100, 1),
+                'Medium (%)': round(counts.get('medium', 0) * 100, 1),
+                'High (%)':   round(counts.get('high',   0) * 100, 1),
+                'Rows':       len(df),
+            })
+        st.dataframe(pd.DataFrame(class_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "The class distributions differ meaningfully across personas — this is "
+            "what makes personalised models outperform generic ones."
+        )
+
+        st.divider()
+
+        # ── Step 2: cross-user experiment ────────────────────────────────────
+        st.subheader("2 · Cross-User Personalisation Experiment")
+        st.markdown("""
+        For each user:
+        - **Personal model** — trained on that user's data only
+        - **Generic model** — trained on all *other* users' data
+        - Both evaluated on the same user's held-out test set (last 20 %)
+
+        If the personal model consistently wins, personalisation is proven.
+        """)
+
+        col_ep, col_win, col_pat = st.columns(3)
+        with col_ep:
+            p_epochs  = st.slider("LSTM epochs", 10, 60, 25, 5, key="p_epochs")
+        with col_win:
+            p_window  = st.slider("Window (steps)", 5, 30, 15, 5, key="p_window")
+        with col_pat:
+            p_patience = st.slider("Early-stop patience", 3, 15, 7, 1, key="p_patience")
+
+        if st.button("Run Cross-User Experiment", type="primary"):
+            progress_bar = st.progress(0.0, text="Training models …")
+            evaluator = CrossUserEvaluator(
+                test_frac=0.20,
+                window=p_window,
+                epochs=p_epochs,
+                patience=p_patience,
+            )
+            results = evaluator.run(
+                st.session_state.persona_datasets,
+                progress_callback=lambda p: progress_bar.progress(
+                    p, text=f"Training models … {int(p * 100)} %"
+                ),
+            )
+            progress_bar.empty()
+            st.session_state.cross_user_results = results
+            st.success("Experiment complete.")
+
+        if st.session_state.cross_user_results is not None:
+            res = st.session_state.cross_user_results
+
+            # Highlight delta column
+            st.subheader("Results — Personal vs Generic Accuracy")
+            display = res[[
+                'persona_name', 'personal_acc', 'generic_acc', 'delta_acc',
+                'personal_f1',  'generic_f1',  'delta_f1',
+            ]].rename(columns={
+                'persona_name': 'Persona',
+                'personal_acc': 'Personal Acc',
+                'generic_acc':  'Generic Acc',
+                'delta_acc':    'Δ Acc (personal − generic)',
+                'personal_f1':  'Personal F1',
+                'generic_f1':   'Generic F1',
+                'delta_f1':     'Δ F1',
+            })
+            st.dataframe(
+                display.style.background_gradient(
+                    subset=['Δ Acc (personal − generic)', 'Δ F1'],
+                    cmap='RdYlGn', vmin=-0.05, vmax=0.20,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            mean_delta_acc = res['delta_acc'].mean()
+            mean_delta_f1  = res['delta_f1'].mean()
+            winners = (res['delta_acc'] > 0).sum()
+            st.markdown(
+                f"**Mean Δ accuracy:** `{mean_delta_acc:+.4f}`  |  "
+                f"**Mean Δ F1:** `{mean_delta_f1:+.4f}`  |  "
+                f"**Personal wins:** `{winners}/{len(res)}` personas"
+            )
+
+            # Bar chart
+            fig_delta = px.bar(
+                res,
+                x='persona_name',
+                y=['personal_acc', 'generic_acc'],
+                barmode='group',
+                labels={'value': 'Accuracy', 'persona_name': 'Persona',
+                        'variable': 'Model'},
+                color_discrete_map={
+                    'personal_acc': '#a6e3a1',
+                    'generic_acc':  '#f38ba8',
+                },
+                title='Personal vs Generic Accuracy per User',
+            )
+            fig_delta.update_layout(height=380, legend_title='Model',
+                                    xaxis_tickangle=-20)
+            fig_delta.for_each_trace(lambda t: t.update(
+                name='Personal' if t.name == 'personal_acc' else 'Generic'
+            ))
+            st.plotly_chart(fig_delta, use_container_width=True)
+
+            with st.expander("Raw experiment data"):
+                st.dataframe(res, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Step 3: single-persona ABR simulation ────────────────────────────
+        st.subheader("3 · Persona Streaming Simulation")
+        st.caption(
+            "Run an ABR simulation on a persona's trace using their personal "
+            "LSTM (re-trained here on the full dataset) vs rule / threshold baselines."
+        )
+
+        col_pk, col_ph, col_pseed = st.columns(3)
+        with col_pk:
+            p_persona_key = st.selectbox(
+                "Persona", list(PERSONAS.keys()),
+                format_func=lambda k: PERSONAS[k].name,
+                key="p_sim_persona",
+            )
+        with col_ph:
+            p_hour = st.slider("Stream starts at hour", 0.0, 23.0, 8.5, 0.5,
+                               key="p_sim_hour")
+        with col_pseed:
+            p_sim_seed = st.number_input("Sim seed", 0, 9999, 1, key="p_sim_seed")
+
+        if st.button("Run Persona Simulation", type="primary",
+                     disabled=(st.session_state.persona_datasets is None)):
+            gen = PersonaDataGenerator()
+            ts = gen.generate_streaming_trace(
+                p_persona_key,
+                duration=300,
+                hour_of_day=p_hour,
+                seed=int(p_sim_seed),
+            )
+            st.session_state.persona_ts = ts
+
+            # Train a quick personal model on this user's dataset
+            trainer = PersonalTrainer(window=p_window, epochs=p_epochs,
+                                      patience=p_patience)
+            with st.spinner("Training personal model …"):
+                trainer.fit(st.session_state.persona_datasets[p_persona_key])
+            st.session_state.persona_trainer = trainer
+
+            ml_preds = trainer.predict_series(ts)
+            st.session_state.persona_ml_preds = ml_preds
+
+            engine = StreamingEngine()
+            st.session_state.persona_sim_rule = engine.simulate(ts, method='rule')
+            st.session_state.persona_sim_th   = engine.simulate(ts, method='threshold')
+            st.session_state.persona_sim_ml   = engine.simulate(
+                ts, method='ml', predictions=ml_preds
+            )
+            st.success("Simulation complete.")
+
+        if st.session_state.persona_sim_th is not None:
+            p_sim_rule = st.session_state.persona_sim_rule
+            p_sim_th   = st.session_state.persona_sim_th
+            p_sim_ml   = st.session_state.persona_sim_ml
+            p_ts       = st.session_state.persona_ts
+
+            m_r = compute_metrics(p_sim_rule)
+            m_t = compute_metrics(p_sim_th)
+            m_m = compute_metrics(p_sim_ml)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Rule QoE",      f"{m_r['qoe_score']:.3f}")
+            c2.metric("Rate QoE",      f"{m_t['qoe_score']:.3f}",
+                      delta=round(m_t['qoe_score'] - m_r['qoe_score'], 3))
+            c3.metric("Personal-ML QoE", f"{m_m['qoe_score']:.3f}",
+                      delta=round(m_m['qoe_score'] - m_r['qoe_score'], 3))
+
+            st.plotly_chart(
+                plot_throughput(p_ts), use_container_width=True
+            )
+            st.plotly_chart(
+                plot_quality_timeline(p_sim_th, p_sim_ml, p_sim_rule),
+                use_container_width=True,
+            )
+            st.plotly_chart(
+                plot_buffer(p_sim_th, p_sim_ml, p_sim_rule),
+                use_container_width=True,
+            )
