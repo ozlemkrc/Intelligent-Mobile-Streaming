@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
 
 FEATURES = [
     'throughput_dl', 'throughput_ul', 'latency',
@@ -108,9 +109,7 @@ class PersonalTrainer:
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.patience     = patience
-        self.device       = torch.device(
-            device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
-        )
+        self.device       = self._resolve_device(device)
 
         self.scaler = StandardScaler()
         self.le     = LabelEncoder()
@@ -123,6 +122,25 @@ class PersonalTrainer:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_device(device: Optional[str]) -> torch.device:
+        """
+        Select compute device, falling back to CPU if CUDA is unavailable
+        or if the installed cuDNN kernel is incompatible with the GPU.
+        """
+        if device:
+            return torch.device(device)
+        if not torch.cuda.is_available():
+            return torch.device('cpu')
+        try:
+            # Quick LSTM-path test — catches cuDNN kernel image mismatches.
+            _t = nn.LSTM(1, 1, 1, batch_first=True).cuda()
+            _t(torch.zeros(1, 1, 1).cuda())
+            del _t
+            return torch.device('cuda')
+        except Exception:
+            return torch.device('cpu')
 
     def _label_col(self, df: pd.DataFrame) -> str:
         return 'congestion_true' if 'congestion_true' in df.columns else 'congestion'
@@ -188,7 +206,16 @@ class PersonalTrainer:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.epochs, eta_min=1e-5,
         )
-        criterion = nn.CrossEntropyLoss()
+        # Soft class-weighted loss: square-root of balanced weights.
+        # Full 'balanced' weighting is too aggressive when a class is rare (<5%),
+        # causing training instability.  Square-root weighting gently up-weights
+        # minority classes (e.g. 'low' congestion in rural personas) without
+        # letting rare-class loss dominate the gradient signal.
+        cw = compute_class_weight('balanced', classes=np.unique(y_raw), y=y_raw)
+        cw = np.sqrt(cw)
+        cw = (cw / cw.mean()).astype(np.float32)
+        cw_tensor = torch.FloatTensor(cw).to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=cw_tensor)
 
         best_val_loss  = float('inf')
         best_state:    Optional[dict] = None
