@@ -1,6 +1,15 @@
 """
 Intelligent Mobile Streaming — CSE 476 Term Project
-Streamlit dashboard: Network Simulation · ML Training · Streaming · Comparison
+Per-user ML-based adaptive bitrate streaming in mobile networks.
+
+Tabs
+----
+  Overview        — system description and quick-start
+  Persona Data    — per-user data generation and distribution explorer
+  Model Training  — PersonalLSTM + KNN / RF baseline training on persona data
+  Streaming       — ABR simulation: rule vs rate vs personal-ML
+  Comparison      — metrics, multi-seed statistical analysis, win-rate table
+  Cross-User      — controlled experiment proving personalisation value
 """
 
 import sys
@@ -12,10 +21,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 
-from src.network_simulator import NetworkSimulator
-from src.ml_classifier import FEATURES, CLASSES, NetworkClassifier, lstm_available
+from src.persona_generator import PERSONAS, PersonaDataGenerator
+from src.personal_model import PersonalTrainer, CrossUserEvaluator
+from src.ml_classifier import FEATURES, CLASSES, NetworkClassifier
 from src.streaming_engine import StreamingEngine, QUALITY_ORDER, compute_metrics
 from src.performance_evaluator import (
     compare, plot_quality_timeline, plot_buffer, plot_estimator,
@@ -23,14 +32,8 @@ from src.performance_evaluator import (
     run_multi_seed, plot_multi_seed_bars, plot_multi_seed_distribution,
     compute_win_rates,
 )
-from src.persona_generator import PERSONAS, PersonaDataGenerator
-try:
-    from src.personal_model import PersonalTrainer, CrossUserEvaluator
-    _TORCH_OK = True
-except ImportError:
-    _TORCH_OK = False
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Intelligent Mobile Streaming",
     page_icon="📡",
@@ -40,104 +43,129 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; }
-    .metric-card {
-        background: #1e1e2e; border-radius: 8px; padding: 1rem;
-        text-align: center; margin: 4px;
-    }
-    .metric-value { font-size: 2rem; font-weight: 700; color: #cdd6f4; }
-    .metric-label { font-size: 0.8rem; color: #a6adc8; }
-    .better  { color: #a6e3a1; }
-    .worse   { color: #f38ba8; }
-    .neutral { color: #cba6f7; }
-    h1 { color: #cdd6f4; }
-    /* Fix tab height so labels aren't clipped */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 48px;
-        padding: 0 16px;
-        line-height: 48px;
-        white-space: nowrap;
-    }
-    .stTabs [data-baseweb="tab"] > div {
-        line-height: normal;
-    }
+  .block-container { padding-top: 1.5rem; }
+  .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+  .stTabs [data-baseweb="tab"] {
+    height: 48px; padding: 0 16px;
+    line-height: 48px; white-space: nowrap;
+  }
+  .stTabs [data-baseweb="tab"] > div { line-height: normal; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state defaults ────────────────────────────────────────────────────
-for key in ['dataset', 'classifier', 'ts', 'sim_rule', 'sim_th', 'sim_ml', 'ml_preds',
-            'multi_seed_df', 'multi_seed_n', 'multi_seed_dur',
-            'persona_datasets', 'cross_user_results',
-            'persona_trainer', 'persona_ts', 'persona_sim_rule',
-            'persona_sim_th', 'persona_sim_ml', 'persona_ml_preds']:
-    if key not in st.session_state:
-        st.session_state[key] = None
+# ── Session state ─────────────────────────────────────────────────────────────
+_STATE_KEYS = [
+    'persona_data',         # Dict[persona_key, DataFrame]  — generated datasets
+    'trainer',              # PersonalTrainer  — fitted on selected persona
+    'baseline_clf',         # NetworkClassifier — KNN + RF trained on same data
+    'ts',                   # streaming trace DataFrame
+    'sim_rule', 'sim_th', 'sim_ml',   # ABR simulation results
+    'ml_preds',             # LSTM predictions on ts
+    'multi_seed_df',        # multi-seed comparison DataFrame
+    'cross_user_results',   # CrossUserEvaluator output
+]
+for k in _STATE_KEYS:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📡 IMS Dashboard")
+    st.divider()
+
+    # ── 1. Data generation ────────────────────────────────────────────────────
+    st.subheader("1 · Persona Data")
+    persona_key = st.selectbox(
+        "Active persona",
+        list(PERSONAS.keys()),
+        format_func=lambda k: PERSONAS[k].name,
+    )
+    n_sessions   = st.slider("Sessions per user", 5, 40, 15, 5)
+    session_dur  = st.slider("Session duration (s)", 120, 600, 300, 60)
+    data_seed    = st.number_input("Data seed", 0, 9999, 42, key="data_seed")
+
+    if st.button("Generate All Persona Data", type="primary", use_container_width=True):
+        gen = PersonaDataGenerator()
+        with st.spinner("Generating per-user traces …"):
+            st.session_state.persona_data = gen.generate_all_personas(
+                n_sessions=n_sessions,
+                session_duration=session_dur,
+                seed=int(data_seed),
+            )
+        # Invalidate downstream state
+        for k in ['trainer', 'baseline_clf', 'ts', 'sim_rule', 'sim_th',
+                  'sim_ml', 'ml_preds', 'multi_seed_df', 'cross_user_results']:
+            st.session_state[k] = None
+        n_total = sum(len(d) for d in st.session_state.persona_data.values())
+        st.success(f"{n_total:,} rows · {len(PERSONAS)} users")
 
     st.divider()
 
-    st.subheader("1 · Dataset")
-    n_per_class = st.slider("Samples per class", 100, 1000, 400, 100)
-    rng_seed = st.number_input("Random seed", 0, 9999, 42)
+    # ── 2. Model training ─────────────────────────────────────────────────────
+    st.subheader("2 · Train Models")
+    lstm_window   = st.slider("LSTM window (steps)", 5, 30, 15, 5)
+    lstm_epochs   = st.slider("LSTM epochs", 10, 60, 25, 5)
+    lstm_patience = st.slider("Early-stop patience", 3, 15, 7, 1)
+    knn_k         = st.slider("KNN — k", 1, 21, 5, 2)
+    rf_trees      = st.slider("RF — trees", 50, 300, 100, 50)
 
-    if st.button("Generate Dataset", use_container_width=True, type="primary"):
-        sim = NetworkSimulator()
-        st.session_state.dataset = sim.generate_dataset(n_per_class, rng_seed)
-        st.session_state.classifier = None   # invalidate trained model
-        st.success(f"Generated {len(st.session_state.dataset)} samples.")
+    train_disabled = st.session_state.persona_data is None
+    if st.button("Train on Selected Persona", type="primary",
+                 use_container_width=True, disabled=train_disabled):
+        df = st.session_state.persona_data[persona_key]
 
-    st.divider()
-    st.subheader("2 · Model Training")
-    knn_k      = st.slider("KNN — k neighbours", 1, 21, 5, 2)
-    rf_trees   = st.slider("RF — n estimators", 50, 500, 100, 50)
-    test_split = st.slider("Test split", 0.1, 0.4, 0.2, 0.05)
+        trainer = PersonalTrainer(
+            window=lstm_window, epochs=lstm_epochs, patience=lstm_patience
+        )
+        with st.spinner("Training personal LSTM …"):
+            trainer.fit(df)
+        st.session_state.trainer = trainer
 
-    train_disabled = st.session_state.dataset is None
-    if st.button("Train Models", use_container_width=True, type="primary",
-                 disabled=train_disabled):
-        clf = NetworkClassifier(knn_k=knn_k, rf_trees=rf_trees, random_state=int(rng_seed))
+        clf = NetworkClassifier(knn_k=knn_k, rf_trees=rf_trees)
         with st.spinner("Training KNN & Random Forest …"):
-            clf.train(st.session_state.dataset, test_size=test_split)
-        st.session_state.classifier = clf
+            clf.train(df)
+        st.session_state.baseline_clf = clf
+
+        for k in ['ts', 'sim_rule', 'sim_th', 'sim_ml', 'ml_preds', 'multi_seed_df']:
+            st.session_state[k] = None
         st.success("Models trained.")
 
     st.divider()
-    st.subheader("3 · Streaming Simulation")
-    sim_duration = st.slider("Duration (seconds)", 60, 600, 300, 30)
-    sim_seed     = st.number_input("Simulation seed", 0, 9999, 7)
-    ml_model_name = st.selectbox("Active ML model", ['Random Forest', 'KNN'])
 
-    sim_disabled = st.session_state.classifier is None
-    if st.button("Run Simulation", use_container_width=True, type="primary",
+    # ── 3. Streaming simulation ───────────────────────────────────────────────
+    st.subheader("3 · Streaming")
+    sim_hour = st.slider("Stream starts at hour", 0.0, 23.0, 8.5, 0.5)
+    sim_dur  = st.slider("Duration (s)", 60, 600, 300, 30)
+    sim_seed = st.number_input("Sim seed", 0, 9999, 7, key="sim_seed")
+
+    sim_disabled = st.session_state.trainer is None
+    if st.button("Run Simulation", type="primary", use_container_width=True,
                  disabled=sim_disabled):
-        ns = NetworkSimulator()
-        ts = ns.generate_time_series(sim_duration, int(sim_seed))
+        gen = PersonaDataGenerator()
+        ts  = gen.generate_streaming_trace(
+            persona_key, duration=sim_dur,
+            hour_of_day=sim_hour, seed=int(sim_seed),
+        )
         st.session_state.ts = ts
 
-        clf = st.session_state.classifier
-        ml_preds = clf.predict_series(ts, model_name=ml_model_name)
-        st.session_state.ml_preds = ml_preds
+        preds = st.session_state.trainer.predict_series(ts)
+        st.session_state.ml_preds = preds
 
         engine = StreamingEngine()
         st.session_state.sim_rule = engine.simulate(ts, method='rule')
         st.session_state.sim_th   = engine.simulate(ts, method='threshold')
-        st.session_state.sim_ml   = engine.simulate(ts, method='ml', predictions=ml_preds)
+        st.session_state.sim_ml   = engine.simulate(ts, method='ml', predictions=preds)
+        st.session_state.multi_seed_df = None
         st.success("Simulation complete.")
 
-# ── Main tabs ─────────────────────────────────────────────────────────────────
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
     "🏠 Overview",
-    "📊 Network Data",
-    "🤖 ML Training",
+    "📊 Persona Data",
+    "🤖 Model Training",
     "▶️ Streaming",
     "📈 Comparison",
-    "👤 Persona AI",
+    "🧪 Cross-User",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,104 +174,119 @@ tabs = st.tabs([
 with tabs[0]:
     st.title("Intelligent Mobile Streaming")
     st.markdown("""
-    ### What this system does
+    ### System overview
 
     | Step | Module | Description |
     |------|--------|-------------|
-    | 1 | **Network Simulator** | Generates synthetic mobile network traces (throughput, latency, packet loss, jitter, signal strength, mobility speed) for three congestion levels |
-    | 2 | **ML Classifier** | Trains K-Nearest Neighbours and Random Forest models to predict network congestion class from raw measurements |
-    | 3 | **Streaming Engine** | Simulates an ABR video session. Both controllers consume the same throughput estimate (harmonic mean over a sliding window). The ML method additionally scales that estimate by a class-conditional safety factor (low=1.00, medium=0.80, high=0.60) — when the classifier predicts congestion, the controller picks more conservatively |
-    | 4 | **Performance Evaluator** | Compares both methods across rebuffering events, average quality, quality stability, and adaptation accuracy. Includes multi-seed statistical analysis |
-
-    ### Network parameters modelled
-    """)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("""
-        - **Throughput DL / UL** (Mbps)
-        - **Latency** (ms)
-        - **Packet Loss** (%)
-        """)
-    with col_b:
-        st.markdown("""
-        - **Jitter** (ms)
-        - **Signal Strength** (dBm)
-        - **Mobility Speed** (km/h)
-        """)
-
-    st.markdown("""
-    ### Quality levels
-
-    | Label | Bitrate |
-    |-------|---------|
-    | 240p  | 300 kbps |
-    | 480p  | 1 000 kbps |
-    | 720p  | 2 500 kbps |
-    | 1080p | 5 000 kbps |
+    | 1 | **Persona Generator** | Five user archetypes, each with home / work / commute anchors. Metrics emerge from a capacity model coupling RSSI and cell load — labels are not pre-assigned |
+    | 2 | **Personal LSTM** | PyTorch 2-layer LSTM trained on *one user's* data. Learns that user's specific location fingerprints and schedule |
+    | 3 | **KNN / RF baselines** | Scikit-learn classifiers trained on the same persona data for fair comparison |
+    | 4 | **Streaming Engine** | Buffer-based ABR simulation comparing rule-based, rate-based, and ML-based controllers |
+    | 5 | **Cross-User Experiment** | Proves personalisation: personal model vs generic model on each user's held-out test data |
 
     ### Quick start
-    1. **Generate Dataset** in the sidebar → explore distributions in *Network Data*
-    2. **Train Models** → inspect accuracy and confusion matrices in *ML Training*
-    3. **Run Simulation** → watch quality timelines in *Streaming*
-    4. Switch to **Comparison** for the full performance breakdown
+    1. **Generate All Persona Data** in the sidebar
+    2. **Train on Selected Persona** — LSTM + KNN + RF all fitted on the same data
+    3. **Run Simulation** — see quality timelines in *Streaming*
+    4. Switch to **Comparison** for multi-seed statistical analysis
+    5. Use **Cross-User** to run the personalisation proof experiment
+
+    ### The five personas
+
+    | Persona | Typical pattern |
+    |---------|-----------------|
+    | Urban Commuter (Alice) | Bimodal — excellent at office/home, terrible in subway |
+    | Suburban Student (Bob) | Mostly low congestion (campus 5G), medium at home |
+    | Rural Remote (Charlie) | Consistently weak signal → medium–high congestion |
+    | Dense Urban (Dana)     | Strong signal, high cell load → persistent medium |
+    | Frequent Traveler (Eve)| Highly variable; frequent handoffs at speed |
+
+    ### Network parameters generated
+
+    `throughput_dl` · `throughput_ul` · `latency` · `packet_loss` · `jitter` · `signal_strength` · `mobility_speed`
     """)
 
-    if lstm_available():
-        st.info("TensorFlow detected — LSTM model is available in the ML Training tab.")
-    else:
-        st.warning("TensorFlow not installed — LSTM is disabled. `pip install tensorflow` to enable it.")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 1 — Network Data
+# TAB 1 — Persona Data
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[1]:
-    st.header("Network Data Explorer")
+    st.header("Persona Data Explorer")
 
-    if st.session_state.dataset is None:
-        st.info("Generate a dataset from the sidebar first.")
+    if st.session_state.persona_data is None:
+        st.info("Generate data from the sidebar first.")
     else:
-        df = st.session_state.dataset
-        n_low    = (df.congestion == 'low').sum()
-        n_med    = (df.congestion == 'medium').sum()
-        n_high   = (df.congestion == 'high').sum()
+        pds = st.session_state.persona_data
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Samples", len(df))
-        c2.metric("Low Congestion", n_low)
-        c3.metric("Medium Congestion", n_med)
-        c4.metric("High Congestion", n_high)
-
-        st.subheader("Feature Distributions by Congestion Class")
-        feat_select = st.selectbox("Select feature", FEATURES)
-        fig_hist = px.histogram(
-            df, x=feat_select, color='congestion', barmode='overlay',
-            color_discrete_map={'low': '#2ca02c', 'medium': '#ff7f0e', 'high': '#d62728'},
-            nbins=50, opacity=0.75,
-            labels={feat_select: feat_select.replace('_', ' ').title()},
+        # Congestion class breakdown
+        st.subheader("Congestion Class Breakdown per Persona")
+        class_rows = []
+        for k, df in pds.items():
+            cnt = df['congestion_true'].value_counts(normalize=True)
+            class_rows.append({
+                'Persona':    PERSONAS[k].name,
+                'Low (%)':    round(cnt.get('low',    0) * 100, 1),
+                'Medium (%)': round(cnt.get('medium', 0) * 100, 1),
+                'High (%)':   round(cnt.get('high',   0) * 100, 1),
+                'Rows':       len(df),
+            })
+        st.dataframe(pd.DataFrame(class_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Distributions differ meaningfully across personas because labels emerge "
+            "from the physics of each user's locations — not from pre-set class buckets."
         )
-        fig_hist.update_layout(height=340)
-        st.plotly_chart(fig_hist, use_container_width=True)
 
-        st.subheader("Feature Correlation Heatmap")
-        corr = df[FEATURES].corr().round(2)
-        fig_corr = px.imshow(
-            corr, text_auto=True, color_continuous_scale='RdBu_r',
-            zmin=-1, zmax=1, aspect='auto',
+        st.divider()
+
+        # Feature distribution comparison
+        st.subheader("Feature Distributions by Persona")
+        feat_sel = st.selectbox(
+            "Feature", FEATURES,
+            format_func=lambda f: f.replace('_', ' ').title(),
         )
-        fig_corr.update_layout(height=420)
-        st.plotly_chart(fig_corr, use_container_width=True)
+        combined = pd.concat(
+            [df.assign(persona_name=PERSONAS[k].name) for k, df in pds.items()],
+            ignore_index=True,
+        )
+        fig_dist = px.histogram(
+            combined, x=feat_sel, color='persona_name', barmode='overlay',
+            opacity=0.65, nbins=60,
+            labels={feat_sel: feat_sel.replace('_', ' ').title()},
+            title=f"{feat_sel.replace('_', ' ').title()} — all personas overlaid",
+        )
+        fig_dist.update_layout(height=360, legend_title='Persona')
+        st.plotly_chart(fig_dist, use_container_width=True)
 
-        st.subheader("Pairwise Scatter (sample)")
-        feat_pair = st.multiselect(
-            "Features for scatter matrix",
+        # Selected persona detail
+        st.subheader(f"Selected Persona — {PERSONAS[persona_key].name}")
+        df_sel = pds[persona_key]
+        col_loc, col_cls = st.columns(2)
+        with col_loc:
+            loc_counts = df_sel['location'].value_counts()
+            fig_loc = px.pie(values=loc_counts.values, names=loc_counts.index,
+                             title='Time at each location')
+            fig_loc.update_layout(height=300)
+            st.plotly_chart(fig_loc, use_container_width=True)
+        with col_cls:
+            cls_counts = df_sel['congestion_true'].value_counts()
+            fig_cls = px.pie(
+                values=cls_counts.values, names=cls_counts.index,
+                color=cls_counts.index,
+                color_discrete_map={'low': '#2ca02c', 'medium': '#ff7f0e', 'high': '#d62728'},
+                title='Congestion class distribution',
+            )
+            fig_cls.update_layout(height=300)
+            st.plotly_chart(fig_cls, use_container_width=True)
+
+        st.subheader("Pairwise Scatter (500-row sample)")
+        pair_feats = st.multiselect(
+            "Features",
             FEATURES,
-            default=['throughput_dl', 'latency', 'packet_loss', 'signal_strength'],
+            default=['throughput_dl', 'latency', 'signal_strength', 'packet_loss'],
         )
-        if len(feat_pair) >= 2:
-            sample = df.sample(min(500, len(df)), random_state=1)
+        if len(pair_feats) >= 2:
+            sample = df_sel.sample(min(500, len(df_sel)), random_state=1)
             fig_pair = px.scatter_matrix(
-                sample, dimensions=feat_pair, color='congestion',
+                sample, dimensions=pair_feats, color='congestion_true',
                 color_discrete_map={'low': '#2ca02c', 'medium': '#ff7f0e', 'high': '#d62728'},
             )
             fig_pair.update_traces(diagonal_visible=False, marker_size=3)
@@ -251,110 +294,102 @@ with tabs[1]:
             st.plotly_chart(fig_pair, use_container_width=True)
 
         with st.expander("Raw data preview"):
-            st.dataframe(df.head(100), use_container_width=True)
+            st.dataframe(df_sel.head(200), use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 2 — ML Training
+# TAB 2 — Model Training
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[2]:
-    st.header("Machine Learning — Training & Evaluation")
+    st.header("Model Training")
 
-    if st.session_state.classifier is None:
+    if st.session_state.trainer is None:
         st.info("Train models from the sidebar first.")
     else:
-        clf: NetworkClassifier = st.session_state.classifier
-        results = clf.results
+        trainer: PersonalTrainer = st.session_state.trainer
+        clf: NetworkClassifier   = st.session_state.baseline_clf
+        df_train = st.session_state.persona_data[persona_key]
 
-        # ── Summary table ──
-        st.subheader("Model Performance Summary")
+        st.subheader(f"Training data — {PERSONAS[persona_key].name}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total rows", f"{len(df_train):,}")
+        c2.metric("LSTM window", trainer.window)
+        c3.metric("LSTM epochs trained", len(trainer.train_losses))
+
+        # LSTM training curves
+        if trainer.train_losses:
+            st.subheader("LSTM Training Curves")
+            curve_df = pd.DataFrame({
+                'epoch':      list(range(1, len(trainer.train_losses) + 1)),
+                'Train loss': trainer.train_losses,
+                'Val loss':   trainer.val_losses,
+            })
+            fig_loss = px.line(
+                curve_df.melt('epoch', var_name='Split', value_name='Loss'),
+                x='epoch', y='Loss', color='Split',
+                title='Cross-entropy loss per epoch',
+            )
+            fig_loss.update_layout(height=300)
+            st.plotly_chart(fig_loss, use_container_width=True)
+
+        # LSTM evaluation on full dataset
+        st.subheader("LSTM — Evaluation on Full Persona Dataset")
+        lstm_metrics = trainer.evaluate(df_train)
+        lc1, lc2 = st.columns(2)
+        lc1.metric("Accuracy", f"{lstm_metrics['accuracy']:.3f}")
+        lc2.metric("F1 Macro", f"{lstm_metrics['f1_macro']:.3f}")
+
+        cm_lstm = lstm_metrics['confusion_matrix']
+        cls_names = lstm_metrics['class_names']
+        fig_cm_lstm = px.imshow(
+            cm_lstm, text_auto=True,
+            x=cls_names, y=cls_names,
+            color_continuous_scale='Blues',
+            labels={'x': 'Predicted', 'y': 'Actual'},
+            title='LSTM Confusion Matrix',
+        )
+        fig_cm_lstm.update_layout(height=320, coloraxis_showscale=False)
+        st.plotly_chart(fig_cm_lstm, use_container_width=True)
+
+        # KNN / RF baselines
+        st.divider()
+        st.subheader("KNN & Random Forest — Baselines")
         summary_rows = []
-        for name, r in results.items():
+        for name, r in clf.results.items():
             rep = r['report']
+            # label_names order matches LabelEncoder (alphabetical: high/low/medium)
             summary_rows.append({
-                'Model':     name,
-                'Accuracy':  f"{r['accuracy']:.3f}",
-                'F1 Macro':  f"{r['f1_macro']:.3f}",
-                'Prec (low)':    f"{rep['low']['precision']:.3f}",
-                'Prec (med)':    f"{rep['medium']['precision']:.3f}",
-                'Prec (high)':   f"{rep['high']['precision']:.3f}",
-                'Recall (low)':  f"{rep['low']['recall']:.3f}",
-                'Recall (med)':  f"{rep['medium']['recall']:.3f}",
-                'Recall (high)': f"{rep['high']['recall']:.3f}",
+                'Model':    name,
+                'Accuracy': f"{r['accuracy']:.3f}",
+                'F1 Macro': f"{r['f1_macro']:.3f}",
             })
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        # ── Confusion matrices ──
-        st.subheader("Confusion Matrices")
-        cm_cols = st.columns(len(results))
-        for col, (name, r) in zip(cm_cols, results.items()):
-            cm = r['confusion_matrix']
+        cm_cols = st.columns(len(clf.results))
+        for col, (name, r) in zip(cm_cols, clf.results.items()):
             fig_cm = px.imshow(
-                cm, text_auto=True,
-                x=CLASSES, y=CLASSES,
+                r['confusion_matrix'], text_auto=True,
                 color_continuous_scale='Blues',
                 labels={'x': 'Predicted', 'y': 'Actual'},
                 title=name,
             )
-            fig_cm.update_layout(height=320, coloraxis_showscale=False)
+            fig_cm.update_layout(height=280, coloraxis_showscale=False)
             col.plotly_chart(fig_cm, use_container_width=True)
 
-        # ── Feature importance ──
+        # RF feature importance
         st.subheader("Random Forest — Feature Importance")
         fi = clf.feature_importances_
         fig_fi = px.bar(
             x=list(fi.values()), y=list(fi.keys()),
             orientation='h',
+            color=list(fi.values()), color_continuous_scale='Teal',
             labels={'x': 'Importance', 'y': 'Feature'},
-            color=list(fi.values()),
-            color_continuous_scale='Teal',
         )
-        fig_fi.update_layout(height=320, coloraxis_showscale=False,
+        fig_fi.update_layout(height=300, coloraxis_showscale=False,
                              yaxis={'categoryorder': 'total ascending'})
         st.plotly_chart(fig_fi, use_container_width=True)
 
-        # ── LSTM (optional) ──
-        if lstm_available():
-            st.subheader("LSTM — Time-Series Classifier")
-            st.caption(
-                "Trained on a **stitched time-series** (multiple distinct "
-                "scenario seeds concatenated) — not the shuffled i.i.d. "
-                "dataset, which has no meaningful temporal order."
-            )
-            lstm_epochs    = st.slider("LSTM epochs", 5, 50, 20, 5)
-            lstm_window    = st.slider("LSTM window (time steps)", 5, 30, 10, 5)
-            lstm_segments  = st.slider("Training segments", 4, 16, 8, 2,
-                                        help="Each segment is a fresh time-series with a different scenario seed.")
-            lstm_seg_dur   = st.slider("Seconds per segment", 120, 600, 300, 60)
-            if st.button("Train LSTM", type="primary"):
-                from src.ml_classifier import LSTMClassifier
-                ns = NetworkSimulator()
-                with st.spinner("Generating training sequence …"):
-                    train_seq = ns.generate_training_sequence(
-                        n_segments=lstm_segments,
-                        segment_duration=lstm_seg_dur,
-                    )
-                lstm_clf = LSTMClassifier(window=lstm_window, epochs=lstm_epochs)
-                with st.spinner(f"Training LSTM on {len(train_seq)} time-steps …"):
-                    lstm_res = lstm_clf.train(train_seq)
-                st.success(
-                    f"LSTM — Accuracy: {lstm_res['accuracy']:.3f}  |  "
-                    f"F1 Macro: {lstm_res['f1_macro']:.3f}  |  "
-                    f"Trained on {len(train_seq)} steps."
-                )
-                cm = lstm_res['confusion_matrix']
-                fig_lstm = px.imshow(
-                    cm, text_auto=True, x=CLASSES, y=CLASSES,
-                    color_continuous_scale='Blues',
-                    labels={'x': 'Predicted', 'y': 'Actual'},
-                    title='LSTM Confusion Matrix',
-                )
-                fig_lstm.update_layout(height=320, coloraxis_showscale=False)
-                st.plotly_chart(fig_lstm, use_container_width=True)
-        else:
-            st.info("Install TensorFlow to enable the LSTM classifier.")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 3 — Streaming Simulation
+# TAB 3 — Streaming
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[3]:
     st.header("Adaptive Bitrate Streaming Simulation")
@@ -366,112 +401,44 @@ with tabs[3]:
         sim_rule = st.session_state.sim_rule
         sim_th   = st.session_state.sim_th
         sim_ml   = st.session_state.sim_ml
+        m_r      = compute_metrics(sim_rule)
+        m_t      = compute_metrics(sim_th)
+        m_m      = compute_metrics(sim_ml)
 
-        # Quick metrics
-        m_rule = compute_metrics(sim_rule)
-        m_th   = compute_metrics(sim_th)
-        m_ml   = compute_metrics(sim_ml)
-
-        # ── QoE headline (primary win condition) ──────────────────────────────
         st.subheader("QoE Score  *(avg bitrate − α·rebuffer_secs − β·switches)*")
-        st.caption("α = 0.3 Mbps/s (stall penalty), β = 0.02 Mbps/switch (smoothness penalty). Higher is better.")
-        qoe_rule, qoe_th, qoe_ml = st.columns(3)
-        with qoe_rule:
-            st.metric("Rule-Based QoE", f"{m_rule['qoe_score']:.3f} Mbps-eq.")
-        with qoe_th:
-            st.metric("Rate-Based QoE", f"{m_th['qoe_score']:.3f} Mbps-eq.",
-                      delta=round(m_th['qoe_score'] - m_rule['qoe_score'], 3))
-        with qoe_ml:
-            st.metric("ML-Based QoE",  f"{m_ml['qoe_score']:.3f} Mbps-eq.",
-                      delta=round(m_ml['qoe_score'] - m_rule['qoe_score'], 3))
+        st.caption("α = 0.3 Mbps/s (stall penalty)  ·  β = 0.02 Mbps/switch (smoothness).  Higher is better.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rule-Based QoE",    f"{m_r['qoe_score']:.3f}")
+        c2.metric("Rate-Based QoE",    f"{m_t['qoe_score']:.3f}",
+                  delta=round(m_t['qoe_score'] - m_r['qoe_score'], 3))
+        c3.metric("Personal-ML QoE",   f"{m_m['qoe_score']:.3f}",
+                  delta=round(m_m['qoe_score'] - m_r['qoe_score'], 3))
 
         st.divider()
-
-        # ── Supporting metrics ────────────────────────────────────────────────
-        col_rule, col_th, col_ml = st.columns(3)
-        with col_rule:
-            st.markdown("#### Rule-Based  \n*(naive threshold rule — proposal baseline)*")
-            st.metric("Avg Bitrate",          f"{m_rule['avg_bitrate_mbps']:.3f} Mbps")
-            st.metric("Rebuffering Events",   m_rule['rebuffer_events'])
-            st.metric("Rebuffering Duration", f"{m_rule['rebuffer_secs']}s")
-            st.metric("Quality Switches",     m_rule['quality_switches'])
-            st.metric("Mean Quality Index",   f"{m_rule['mean_quality_idx']:.2f} / 3")
-            st.metric("Adaptation Accuracy",  f"{m_rule['adapt_accuracy']*100:.1f}%")
-
-        with col_th:
-            st.markdown("#### Rate-Based  \n*(harmonic-mean estimator)*")
-            st.metric("Avg Bitrate",
-                      f"{m_th['avg_bitrate_mbps']:.3f} Mbps",
-                      delta=round(m_th['avg_bitrate_mbps'] - m_rule['avg_bitrate_mbps'], 3))
-            st.metric("Rebuffering Events",
-                      m_th['rebuffer_events'],
-                      delta=m_th['rebuffer_events'] - m_rule['rebuffer_events'],
-                      delta_color="inverse")
-            st.metric("Rebuffering Duration",
-                      f"{m_th['rebuffer_secs']}s",
-                      delta=m_th['rebuffer_secs'] - m_rule['rebuffer_secs'],
-                      delta_color="inverse")
-            st.metric("Quality Switches",
-                      m_th['quality_switches'],
-                      delta=m_th['quality_switches'] - m_rule['quality_switches'],
-                      delta_color="inverse")
-            st.metric("Mean Quality Index",
-                      f"{m_th['mean_quality_idx']:.2f} / 3",
-                      delta=round(m_th['mean_quality_idx'] - m_rule['mean_quality_idx'], 3))
-            st.metric("Adaptation Accuracy",
-                      f"{m_th['adapt_accuracy']*100:.1f}%",
-                      delta=f"{(m_th['adapt_accuracy'] - m_rule['adapt_accuracy'])*100:.1f}%")
-
-        with col_ml:
-            st.markdown("#### ML-Based  \n*(estimate × class safety factor)*")
-            st.metric("Avg Bitrate",
-                      f"{m_ml['avg_bitrate_mbps']:.3f} Mbps",
-                      delta=round(m_ml['avg_bitrate_mbps'] - m_rule['avg_bitrate_mbps'], 3))
-            st.metric("Rebuffering Events",
-                      m_ml['rebuffer_events'],
-                      delta=m_ml['rebuffer_events'] - m_rule['rebuffer_events'],
-                      delta_color="inverse")
-            st.metric("Rebuffering Duration",
-                      f"{m_ml['rebuffer_secs']}s",
-                      delta=m_ml['rebuffer_secs'] - m_rule['rebuffer_secs'],
-                      delta_color="inverse")
-            st.metric("Quality Switches",
-                      m_ml['quality_switches'],
-                      delta=m_ml['quality_switches'] - m_rule['quality_switches'],
-                      delta_color="inverse")
-            st.metric("Mean Quality Index",
-                      f"{m_ml['mean_quality_idx']:.2f} / 3",
-                      delta=round(m_ml['mean_quality_idx'] - m_rule['mean_quality_idx'], 3))
-            st.metric("Adaptation Accuracy",
-                      f"{m_ml['adapt_accuracy']*100:.1f}%",
-                      delta=f"{(m_ml['adapt_accuracy'] - m_rule['adapt_accuracy'])*100:.1f}%")
-        st.caption("Δ values compare each controller against the **Rule-Based** baseline (the proposal's traditional threshold method).")
+        col_r, col_t, col_m = st.columns(3)
+        for col, label, m in [
+            (col_r, "Rule-Based  *(naive threshold)*",           m_r),
+            (col_t, "Rate-Based  *(harmonic-mean estimate)*",    m_t),
+            (col_m, "Personal-ML  *(estimate × LSTM safety)*",  m_m),
+        ]:
+            with col:
+                st.markdown(f"#### {label}")
+                st.metric("Avg Bitrate",         f"{m['avg_bitrate_mbps']:.3f} Mbps")
+                st.metric("Rebuffering Events",  m['rebuffer_events'])
+                st.metric("Rebuffering (s)",     m['rebuffer_secs'])
+                st.metric("Quality Switches",    m['quality_switches'])
+                st.metric("Adaptation Accuracy", f"{m['adapt_accuracy']*100:.1f}%")
 
         st.divider()
-
-        # Network throughput timeline
-        st.plotly_chart(plot_throughput(ts), use_container_width=True)
-
-        # Estimator signal (actual vs effective for all three methods)
-        st.plotly_chart(plot_estimator(sim_th, sim_ml, sim_rule),
-                        use_container_width=True)
-
-        # Quality timelines
-        st.plotly_chart(plot_quality_timeline(sim_th, sim_ml, sim_rule),
-                        use_container_width=True)
-
-        # Buffer levels
-        st.plotly_chart(plot_buffer(sim_th, sim_ml, sim_rule),
-                        use_container_width=True)
+        st.plotly_chart(plot_throughput(ts),                          use_container_width=True)
+        st.plotly_chart(plot_estimator(sim_th, sim_ml, sim_rule),     use_container_width=True)
+        st.plotly_chart(plot_quality_timeline(sim_th, sim_ml, sim_rule), use_container_width=True)
+        st.plotly_chart(plot_buffer(sim_th, sim_ml, sim_rule),        use_container_width=True)
 
         with st.expander("Raw simulation data"):
-            view = st.radio("Show data for:",
-                            ['Rule-Based', 'Rate-Based', 'ML-Based'],
-                            horizontal=True)
-            df_show = {'Rule-Based': sim_rule,
-                       'Rate-Based': sim_th,
-                       'ML-Based':   sim_ml}[view]
-            st.dataframe(df_show, use_container_width=True)
+            view = st.radio("Show:", ['Rule-Based', 'Rate-Based', 'ML-Based'], horizontal=True)
+            st.dataframe({'Rule-Based': sim_rule, 'Rate-Based': sim_th,
+                          'ML-Based': sim_ml}[view], use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 4 — Comparison
@@ -487,20 +454,20 @@ with tabs[4]:
         sim_ml   = st.session_state.sim_ml
         metrics  = compare(sim_th, sim_ml, sim_rule)
 
-        st.plotly_chart(plot_comparison_bars(metrics), use_container_width=True)
+        st.plotly_chart(plot_comparison_bars(metrics),      use_container_width=True)
         st.plotly_chart(plot_quality_distribution(metrics), use_container_width=True)
 
         st.subheader("Metric Table")
         metric_rows = []
         for key, label in [
-            ('qoe_score',        'QoE Score (Mbps-eq.) (↑ headline)'),
-            ('avg_bitrate_mbps', 'Avg Bitrate (Mbps)   (↑ better)'),
-            ('rebuffer_events',  'Rebuffering Events   (↓ better)'),
-            ('rebuffer_secs',    'Rebuffering Dur. (s) (↓ better)'),
-            ('quality_switches', 'Quality Switches     (↓ better)'),
-            ('mean_quality_idx', 'Mean Quality Index   (↑ better)'),
-            ('adapt_accuracy',   'Adaptation Accuracy %(↑ better)'),
-            ('quality_mismatch', 'Quality Mismatch     (↓ better)'),
+            ('qoe_score',        'QoE Score (Mbps-eq.) ↑'),
+            ('avg_bitrate_mbps', 'Avg Bitrate (Mbps) ↑'),
+            ('rebuffer_events',  'Rebuffering Events ↓'),
+            ('rebuffer_secs',    'Rebuffering Duration (s) ↓'),
+            ('quality_switches', 'Quality Switches ↓'),
+            ('mean_quality_idx', 'Mean Quality Index ↑'),
+            ('adapt_accuracy',   'Adaptation Accuracy ↑'),
+            ('quality_mismatch', 'Quality Mismatch ↓'),
         ]:
             metric_rows.append({
                 'Metric':     label,
@@ -510,263 +477,94 @@ with tabs[4]:
             })
         st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
-        # Narrative conclusion — primary contrast is ML vs Rule-Based,
-        # which is what the proposal asks the project to demonstrate.
-        st.subheader("Analysis — ML vs Rule-Based (proposal contrast)")
-        m_rule = metrics['Rule-Based']
-        m_ml   = metrics['ML-Based']
-
-        qoe_diff   = m_ml['qoe_score']          - m_rule['qoe_score']
-        rb_diff    = m_rule['rebuffer_events']   - m_ml['rebuffer_events']
-        sw_diff    = m_rule['quality_switches']  - m_ml['quality_switches']
-        acc_diff   = m_ml['adapt_accuracy']      - m_rule['adapt_accuracy']
-        qual_diff  = m_ml['mean_quality_idx']    - m_rule['mean_quality_idx']
-
-        lines = []
-        # QoE headline — always shown first
-        if qoe_diff > 0:
-            lines.append(
-                f"- **QoE: ML-Based scores +{qoe_diff:.3f} Mbps-equivalent higher** "
-                f"({m_ml['qoe_score']:.3f} vs {m_rule['qoe_score']:.3f}), "
-                "the primary performance win."
-            )
-        elif qoe_diff < 0:
-            lines.append(
-                f"- **QoE: Rule-Based scores +{-qoe_diff:.3f} Mbps-equivalent higher** "
-                f"({m_rule['qoe_score']:.3f} vs {m_ml['qoe_score']:.3f}) in this run."
-            )
-        else:
-            lines.append("- **QoE: Both methods achieved the same score** in this run.")
-
-        # Supporting breakdown
-        if rb_diff > 0:
-            lines.append(f"- ML-Based caused **{rb_diff} fewer rebuffering events**, improving playback continuity.")
-        elif rb_diff < 0:
-            lines.append(f"- The rule baseline caused **{-rb_diff} fewer rebuffering events** in this run.")
-        else:
-            lines.append("- Both methods experienced the same number of rebuffering events.")
-
-        if sw_diff > 0:
-            lines.append(f"- ML-Based made **{sw_diff} fewer quality switches**, indicating higher bitrate stability.")
-        elif sw_diff < 0:
-            lines.append(f"- The rule baseline made **{-sw_diff} fewer quality switches** in this run.")
-
-        if acc_diff > 0:
-            lines.append(f"- ML-Based matched the optimal quality **{acc_diff:.1f}% more often**.")
-        else:
-            lines.append(f"- The rule baseline matched the optimal quality **{-acc_diff:.1f}% more often** in this run.")
-
-        if qual_diff > 0:
-            lines.append(f"- ML-Based delivered a higher average quality index (+{qual_diff:.2f} steps).")
-        elif qual_diff < 0:
-            lines.append(f"- The rule baseline delivered a slightly higher average quality index.")
-
-        st.markdown("\n".join(lines))
-        st.caption(
-            "QoE = avg_bitrate_mbps − 0.3 × rebuffer_secs − 0.02 × quality_switches. "
-            "Results vary with random seed, duration, and model accuracy. "
-            "Use the Multi-Seed Analysis below to test statistical robustness."
-        )
-
-        # ─── Multi-seed statistical analysis ───
+        # ── Multi-seed statistical analysis ────────────────────────────────────
         st.divider()
-        st.subheader("📐 Statistical Robustness — Multi-Seed Analysis")
+        st.subheader("Statistical Robustness — Multi-Seed Analysis")
         st.markdown(
-            "A single run's verdict can flip on a different seed. "
-            "Run **N independent simulations** with different network seeds and "
-            "compare *mean ± std* and *win-rates* per metric."
+            "Run **N independent simulations** at different hours of the day and "
+            "compare mean ± std and win-rates per metric across methods."
         )
-
         col_n, col_d = st.columns(2)
         with col_n:
-            n_runs = st.slider("Number of runs", 5, 50, 20, 5, key="ms_n_runs")
+            n_runs     = st.slider("Number of runs", 5, 50, 20, 5, key="ms_n")
         with col_d:
-            duration_runs = st.slider("Duration per run (s)", 60, 300, 180, 30, key="ms_dur")
+            dur_runs   = st.slider("Duration per run (s)", 60, 300, 180, 30, key="ms_dur")
 
-        if st.button("Run Multi-Seed Analysis", type="primary", key="ms_btn"):
-            progress = st.progress(0.0, text="Running simulations …")
+        if st.button("Run Multi-Seed Analysis", type="primary"):
+            prog = st.progress(0.0, text="Running …")
             df_runs = run_multi_seed(
-                st.session_state.classifier,
+                st.session_state.trainer,
+                persona_key=persona_key,
                 n_runs=n_runs,
-                duration=duration_runs,
-                ml_model_name=ml_model_name,
-                progress_callback=lambda p: progress.progress(p,
-                    text=f"Running simulations … {int(p*100)}%"),
+                duration=dur_runs,
+                progress_callback=lambda p: prog.progress(p, text=f"Running … {int(p*100)} %"),
             )
+            prog.empty()
             st.session_state.multi_seed_df = df_runs
-            st.session_state.multi_seed_n = n_runs
-            st.session_state.multi_seed_dur = duration_runs
-            progress.empty()
 
         if st.session_state.multi_seed_df is not None:
             df_runs = st.session_state.multi_seed_df
-            st.caption(
-                f"Showing results from {st.session_state.multi_seed_n} runs "
-                f"of {st.session_state.multi_seed_dur}s each."
-            )
-
             st.plotly_chart(plot_multi_seed_bars(df_runs), use_container_width=True)
 
-            ms_baseline = st.radio(
-                "Win-rate baseline (compare ML against):",
-                ['Rule-Based', 'Threshold'],
-                horizontal=True,
-                key="ms_win_baseline",
-                help="Rule-Based = naive threshold rule (proposal baseline). "
-                     "Threshold = stronger rate-based ABR controller.",
+            baseline = st.radio(
+                "Win-rate baseline:", ['Rule-Based', 'Threshold'], horizontal=True,
             )
-            st.markdown(
-                f"**Win-Rate Table** — out of N runs, how often ML beats "
-                f"the **{ms_baseline}** controller per metric:"
-            )
-            st.dataframe(compute_win_rates(df_runs, baseline=ms_baseline),
+            st.dataframe(compute_win_rates(df_runs, baseline=baseline),
                          use_container_width=True, hide_index=True)
 
-            box_metric = st.selectbox(
-                "Distribution view — pick a metric:",
+            box_m = st.selectbox(
+                "Distribution view:",
                 ['qoe_score', 'avg_bitrate_mbps', 'rebuffer_events', 'rebuffer_secs',
-                 'quality_switches', 'mean_quality_idx', 'adapt_accuracy', 'quality_mismatch'],
-                key="ms_box_metric",
+                 'quality_switches', 'mean_quality_idx', 'adapt_accuracy'],
             )
-            st.plotly_chart(
-                plot_multi_seed_distribution(df_runs, box_metric),
-                use_container_width=True,
-            )
-
-            with st.expander("Per-run raw metrics"):
-                st.dataframe(df_runs, use_container_width=True, hide_index=True)
+            st.plotly_chart(plot_multi_seed_distribution(df_runs, box_m),
+                            use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 5 — Persona AI
+# TAB 5 — Cross-User Experiment
 # ─────────────────────────────────────────────────────────────────────────────
 with tabs[5]:
-    st.header("Persona AI — Per-User LSTM Training")
-
-    if not _TORCH_OK:
-        st.error("PyTorch is not installed. Run `pip install torch` then restart.")
-        st.stop()
-
+    st.header("Cross-User Personalisation Experiment")
     st.markdown("""
-    Each user persona has three spatial anchors (home, work, commute corridor) with
-    distinct RF and cell-load profiles.  Network metrics are generated from a
-    physically motivated capacity model — **congestion labels emerge from the physics**,
-    not from pre-assigned class distributions.
+    For each user: train a **personal model** on their data only, and a **generic model**
+    on all *other* users' data.  Both are evaluated on the same held-out test set (last 20 %).
 
-    The **cross-user experiment** is the empirical proof: for each persona, a model
-    trained only on *that user's* data is compared against a model trained on all
-    *other* users' data, both evaluated on the same held-out test set.
+    If the personal model consistently outperforms the generic model, the claim is proven:
+    the LSTM has learned user-specific patterns that a population-level model misses.
     """)
 
-    st.divider()
-
-    # ── Step 1: generate per-user data ───────────────────────────────────────
-    st.subheader("1 · Generate Per-User Datasets")
-
-    col_ns, col_dur, col_seed = st.columns(3)
-    with col_ns:
-        p_n_sessions = st.slider("Sessions per user", 5, 40, 15, 5,
-                                 help="Each session = one continuous streaming period.")
-    with col_dur:
-        p_duration = st.slider("Session duration (s)", 120, 600, 300, 60)
-    with col_seed:
-        p_seed = st.number_input("Data seed", 0, 9999, 0, key="p_seed")
-
-    if st.button("Generate Persona Datasets", type="primary"):
-        gen = PersonaDataGenerator()
-        with st.spinner("Generating per-user traces …"):
-            st.session_state.persona_datasets = gen.generate_all_personas(
-                n_sessions=p_n_sessions,
-                session_duration=p_duration,
-                seed=int(p_seed),
-            )
-            st.session_state.cross_user_results = None  # invalidate old results
-            st.session_state.persona_trainer = None
-        n_rows = sum(len(d) for d in st.session_state.persona_datasets.values())
-        st.success(f"Generated {n_rows:,} total rows across {len(PERSONAS)} users.")
-
-    if st.session_state.persona_datasets is not None:
-        pds = st.session_state.persona_datasets
-
-        # Distribution comparison
-        st.subheader("Feature Distributions by Persona")
-        feat_p = st.selectbox(
-            "Feature", FEATURES, key="p_feat_sel",
-            format_func=lambda f: f.replace('_', ' ').title(),
-        )
-        combined = pd.concat(
-            [df.assign(persona_name=PERSONAS[k].name) for k, df in pds.items()],
-            ignore_index=True,
-        )
-        fig_dist = px.histogram(
-            combined, x=feat_p, color='persona_name', barmode='overlay',
-            opacity=0.65, nbins=60,
-            labels={feat_p: feat_p.replace('_', ' ').title()},
-            title=f"Distribution of {feat_p.replace('_', ' ')} across all personas",
-        )
-        fig_dist.update_layout(height=360, legend_title='Persona')
-        st.plotly_chart(fig_dist, use_container_width=True)
-
-        # Congestion class breakdown per persona
-        st.subheader("Congestion Class Breakdown per Persona")
-        class_rows = []
-        for k, df in pds.items():
-            counts = df['congestion_true'].value_counts(normalize=True)
-            class_rows.append({
-                'Persona': PERSONAS[k].name,
-                'Low (%)':    round(counts.get('low',    0) * 100, 1),
-                'Medium (%)': round(counts.get('medium', 0) * 100, 1),
-                'High (%)':   round(counts.get('high',   0) * 100, 1),
-                'Rows':       len(df),
-            })
-        st.dataframe(pd.DataFrame(class_rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "The class distributions differ meaningfully across personas — this is "
-            "what makes personalised models outperform generic ones."
-        )
-
-        st.divider()
-
-        # ── Step 2: cross-user experiment ────────────────────────────────────
-        st.subheader("2 · Cross-User Personalisation Experiment")
-        st.markdown("""
-        For each user:
-        - **Personal model** — trained on that user's data only
-        - **Generic model** — trained on all *other* users' data
-        - Both evaluated on the same user's held-out test set (last 20 %)
-
-        If the personal model consistently wins, personalisation is proven.
-        """)
-
+    if st.session_state.persona_data is None:
+        st.info("Generate persona data from the sidebar first.")
+    else:
         col_ep, col_win, col_pat = st.columns(3)
         with col_ep:
-            p_epochs  = st.slider("LSTM epochs", 10, 60, 25, 5, key="p_epochs")
+            xp_epochs  = st.slider("LSTM epochs", 10, 60, 25, 5, key="xp_ep")
         with col_win:
-            p_window  = st.slider("Window (steps)", 5, 30, 15, 5, key="p_window")
+            xp_window  = st.slider("Window (steps)", 5, 30, 15, 5, key="xp_win")
         with col_pat:
-            p_patience = st.slider("Early-stop patience", 3, 15, 7, 1, key="p_patience")
+            xp_patience = st.slider("Early-stop patience", 3, 15, 7, 1, key="xp_pat")
 
         if st.button("Run Cross-User Experiment", type="primary"):
-            progress_bar = st.progress(0.0, text="Training models …")
-            evaluator = CrossUserEvaluator(
+            prog = st.progress(0.0, text="Training models …")
+            ev = CrossUserEvaluator(
                 test_frac=0.20,
-                window=p_window,
-                epochs=p_epochs,
-                patience=p_patience,
+                window=xp_window,
+                epochs=xp_epochs,
+                patience=xp_patience,
             )
-            results = evaluator.run(
-                st.session_state.persona_datasets,
-                progress_callback=lambda p: progress_bar.progress(
-                    p, text=f"Training models … {int(p * 100)} %"
+            res = ev.run(
+                st.session_state.persona_data,
+                progress_callback=lambda p: prog.progress(
+                    p, text=f"Training models … {int(p*100)} %"
                 ),
             )
-            progress_bar.empty()
-            st.session_state.cross_user_results = results
+            prog.empty()
+            st.session_state.cross_user_results = res
             st.success("Experiment complete.")
 
         if st.session_state.cross_user_results is not None:
             res = st.session_state.cross_user_results
 
-            # Highlight delta column
             st.subheader("Results — Personal vs Generic Accuracy")
             display = res[[
                 'persona_name', 'personal_acc', 'generic_acc', 'delta_acc',
@@ -775,129 +573,44 @@ with tabs[5]:
                 'persona_name': 'Persona',
                 'personal_acc': 'Personal Acc',
                 'generic_acc':  'Generic Acc',
-                'delta_acc':    'Δ Acc (personal − generic)',
+                'delta_acc':    'Δ Acc',
                 'personal_f1':  'Personal F1',
                 'generic_f1':   'Generic F1',
                 'delta_f1':     'Δ F1',
             })
             st.dataframe(
                 display.style.background_gradient(
-                    subset=['Δ Acc (personal − generic)', 'Δ F1'],
+                    subset=['Δ Acc', 'Δ F1'],
                     cmap='RdYlGn', vmin=-0.05, vmax=0.20,
                 ),
-                use_container_width=True,
-                hide_index=True,
+                use_container_width=True, hide_index=True,
             )
 
-            mean_delta_acc = res['delta_acc'].mean()
-            mean_delta_f1  = res['delta_f1'].mean()
-            winners = (res['delta_acc'] > 0).sum()
+            mean_d_acc = res['delta_acc'].mean()
+            wins       = (res['delta_acc'] > 0).sum()
             st.markdown(
-                f"**Mean Δ accuracy:** `{mean_delta_acc:+.4f}`  |  "
-                f"**Mean Δ F1:** `{mean_delta_f1:+.4f}`  |  "
-                f"**Personal wins:** `{winners}/{len(res)}` personas"
+                f"**Mean Δ accuracy:** `{mean_d_acc:+.4f}`  |  "
+                f"**Personal wins:** `{wins}/{len(res)}` personas"
             )
 
-            # Bar chart
-            fig_delta = px.bar(
-                res,
-                x='persona_name',
+            fig_bar = px.bar(
+                res, x='persona_name',
                 y=['personal_acc', 'generic_acc'],
                 barmode='group',
-                labels={'value': 'Accuracy', 'persona_name': 'Persona',
-                        'variable': 'Model'},
                 color_discrete_map={
                     'personal_acc': '#a6e3a1',
                     'generic_acc':  '#f38ba8',
                 },
+                labels={'value': 'Accuracy', 'persona_name': 'Persona',
+                        'variable': 'Model'},
                 title='Personal vs Generic Accuracy per User',
             )
-            fig_delta.update_layout(height=380, legend_title='Model',
-                                    xaxis_tickangle=-20)
-            fig_delta.for_each_trace(lambda t: t.update(
+            fig_bar.for_each_trace(lambda t: t.update(
                 name='Personal' if t.name == 'personal_acc' else 'Generic'
             ))
-            st.plotly_chart(fig_delta, use_container_width=True)
+            fig_bar.update_layout(height=380, xaxis_tickangle=-15,
+                                  legend_title='Model')
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-            with st.expander("Raw experiment data"):
+            with st.expander("Raw results"):
                 st.dataframe(res, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # ── Step 3: single-persona ABR simulation ────────────────────────────
-        st.subheader("3 · Persona Streaming Simulation")
-        st.caption(
-            "Run an ABR simulation on a persona's trace using their personal "
-            "LSTM (re-trained here on the full dataset) vs rule / threshold baselines."
-        )
-
-        col_pk, col_ph, col_pseed = st.columns(3)
-        with col_pk:
-            p_persona_key = st.selectbox(
-                "Persona", list(PERSONAS.keys()),
-                format_func=lambda k: PERSONAS[k].name,
-                key="p_sim_persona",
-            )
-        with col_ph:
-            p_hour = st.slider("Stream starts at hour", 0.0, 23.0, 8.5, 0.5,
-                               key="p_sim_hour")
-        with col_pseed:
-            p_sim_seed = st.number_input("Sim seed", 0, 9999, 1, key="p_sim_seed")
-
-        if st.button("Run Persona Simulation", type="primary",
-                     disabled=(st.session_state.persona_datasets is None)):
-            gen = PersonaDataGenerator()
-            ts = gen.generate_streaming_trace(
-                p_persona_key,
-                duration=300,
-                hour_of_day=p_hour,
-                seed=int(p_sim_seed),
-            )
-            st.session_state.persona_ts = ts
-
-            # Train a quick personal model on this user's dataset
-            trainer = PersonalTrainer(window=p_window, epochs=p_epochs,
-                                      patience=p_patience)
-            with st.spinner("Training personal model …"):
-                trainer.fit(st.session_state.persona_datasets[p_persona_key])
-            st.session_state.persona_trainer = trainer
-
-            ml_preds = trainer.predict_series(ts)
-            st.session_state.persona_ml_preds = ml_preds
-
-            engine = StreamingEngine()
-            st.session_state.persona_sim_rule = engine.simulate(ts, method='rule')
-            st.session_state.persona_sim_th   = engine.simulate(ts, method='threshold')
-            st.session_state.persona_sim_ml   = engine.simulate(
-                ts, method='ml', predictions=ml_preds
-            )
-            st.success("Simulation complete.")
-
-        if st.session_state.persona_sim_th is not None:
-            p_sim_rule = st.session_state.persona_sim_rule
-            p_sim_th   = st.session_state.persona_sim_th
-            p_sim_ml   = st.session_state.persona_sim_ml
-            p_ts       = st.session_state.persona_ts
-
-            m_r = compute_metrics(p_sim_rule)
-            m_t = compute_metrics(p_sim_th)
-            m_m = compute_metrics(p_sim_ml)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Rule QoE",      f"{m_r['qoe_score']:.3f}")
-            c2.metric("Rate QoE",      f"{m_t['qoe_score']:.3f}",
-                      delta=round(m_t['qoe_score'] - m_r['qoe_score'], 3))
-            c3.metric("Personal-ML QoE", f"{m_m['qoe_score']:.3f}",
-                      delta=round(m_m['qoe_score'] - m_r['qoe_score'], 3))
-
-            st.plotly_chart(
-                plot_throughput(p_ts), use_container_width=True
-            )
-            st.plotly_chart(
-                plot_quality_timeline(p_sim_th, p_sim_ml, p_sim_rule),
-                use_container_width=True,
-            )
-            st.plotly_chart(
-                plot_buffer(p_sim_th, p_sim_ml, p_sim_rule),
-                use_container_width=True,
-            )

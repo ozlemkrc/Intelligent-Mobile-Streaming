@@ -344,32 +344,39 @@ HIGHER_BETTER = {
 
 
 def run_multi_seed(
-    classifier,
+    trainer,
+    persona_key: str,
     n_runs: int = 20,
     duration: int = 180,
     base_seed: int = 1000,
-    ml_model_name: str = 'Random Forest',
     progress_callback=None,
 ) -> pd.DataFrame:
-    """Run N simulations with different network seeds; return per-run metrics
-    as a long-format DataFrame with columns: seed, method, <metric>..."""
-    from .network_simulator import NetworkSimulator
+    """Run N simulations with different network seeds for a persona; return
+    per-run metrics as a long-format DataFrame: seed, method, <metric>...
+
+    Each run uses a different hour-of-day so the trace spans varied conditions
+    (home, commute, office) depending on the persona's schedule.
+    """
+    from .persona_generator import PersonaDataGenerator
     from .streaming_engine import StreamingEngine, compute_metrics
 
-    ns = NetworkSimulator()
+    gen    = PersonaDataGenerator()
     engine = StreamingEngine()
-    rows = []
+    rows   = []
 
     for i in range(n_runs):
         seed = base_seed + i
-        ts = ns.generate_time_series(duration, seed)
-        preds = classifier.predict_series(ts, model_name=ml_model_name)
+        hour = float(seed % 24)
+        ts   = gen.generate_streaming_trace(persona_key, duration=duration,
+                                            hour_of_day=hour, seed=seed)
+        preds    = trainer.predict_series(ts)
         sim_rule = engine.simulate(ts, method='rule')
-        sim_th = engine.simulate(ts, method='threshold')
-        sim_ml = engine.simulate(ts, method='ml', predictions=preds)
-        for method, m in [('Rule-Based', compute_metrics(sim_rule)),
-                          ('Threshold',  compute_metrics(sim_th)),
-                          ('ML-Based',   compute_metrics(sim_ml))]:
+        sim_th   = engine.simulate(ts, method='threshold')
+        sim_ml   = engine.simulate(ts, method='ml', predictions=preds)
+        for method, sim in [('Rule-Based', sim_rule),
+                             ('Threshold',  sim_th),
+                             ('ML-Based',   sim_ml)]:
+            m   = compute_metrics(sim)
             row = {'seed': seed, 'method': method}
             row.update({k: v for k, v in m.items() if k != 'quality_distribution'})
             rows.append(row)
