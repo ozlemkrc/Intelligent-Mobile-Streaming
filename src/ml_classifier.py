@@ -85,6 +85,27 @@ class NetworkClassifier:
         """Predict for every row in a time-series DataFrame."""
         return self.predict(df[FEATURES].values, model_name)
 
+    def evaluate_on_trace(
+        self, ts: pd.DataFrame, model_name: str = 'Random Forest'
+    ) -> dict:
+        """Classify the streaming trace and score against congestion_true.
+
+        Distinct from the i.i.d. test-set evaluation in train(): the trace is
+        sequential and drawn from a different sampling process (time-correlated,
+        scenario-cycled), so accuracy here is the defensible 'does the ML→ABR
+        story hold in practice?' number.
+        """
+        preds = self.predict_series(ts, model_name=model_name)
+        true  = ts['congestion_true'].values
+        return {
+            'accuracy':         accuracy_score(true, preds),
+            'f1_macro':         f1_score(true, preds, average='macro',
+                                         zero_division=0, labels=CLASSES),
+            'confusion_matrix': confusion_matrix(true, preds, labels=CLASSES),
+            'y_true':           true,
+            'y_pred':           preds,
+        }
+
 
 # ------------------------------------------------------------------
 # Optional LSTM classifier
@@ -125,11 +146,22 @@ class LSTMClassifier:
         return np.array(Xs), np.array(ys)
 
     def train(self, df: pd.DataFrame, test_size: float = 0.2):
-        X = self.scaler.fit_transform(df[FEATURES].values)
-        y = self.le.transform(df['congestion'].values)
-        split = int(len(X) * (1 - test_size))
-        X_train, X_test = X[:split], X[split:]
+        # Accept time-series frames (label column 'congestion_true') or
+        # i.i.d. dataset frames (label column 'congestion'). For an LSTM
+        # the former is what's actually meaningful — the i.i.d. frame is
+        # shuffled so its temporal dimension is noise.
+        label_col = 'congestion_true' if 'congestion_true' in df.columns else 'congestion'
+        X_raw = df[FEATURES].values
+        y = self.le.transform(df[label_col].values)
+
+        split = int(len(X_raw) * (1 - test_size))
+        X_train_raw, X_test_raw = X_raw[:split], X_raw[split:]
         y_train, y_test = y[:split], y[split:]
+
+        # Fit the scaler on TRAIN ONLY — fitting on the full array leaks
+        # test-set statistics into the model.
+        X_train = self.scaler.fit_transform(X_train_raw)
+        X_test = self.scaler.transform(X_test_raw)
 
         Xs_train, ys_train = self._build_sequences(X_train, y_train)
         Xs_test, ys_test = self._build_sequences(X_test, y_test)

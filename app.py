@@ -18,8 +18,10 @@ from src.network_simulator import NetworkSimulator
 from src.ml_classifier import FEATURES, CLASSES, NetworkClassifier, lstm_available
 from src.streaming_engine import StreamingEngine, QUALITY_ORDER, compute_metrics
 from src.performance_evaluator import (
-    compare, plot_quality_timeline, plot_buffer,
+    compare, plot_quality_timeline, plot_buffer, plot_estimator,
     plot_throughput, plot_comparison_bars, plot_quality_distribution,
+    run_multi_seed, plot_multi_seed_bars, plot_multi_seed_distribution,
+    compute_win_rates,
 )
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -60,7 +62,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state defaults ────────────────────────────────────────────────────
-for key in ['dataset', 'classifier', 'ts', 'sim_th', 'sim_ml', 'ml_preds']:
+for key in ['dataset', 'classifier', 'ts', 'sim_rule', 'sim_th', 'sim_ml', 'ml_preds',
+            'multi_seed_df', 'multi_seed_n', 'multi_seed_dur']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -113,8 +116,9 @@ with st.sidebar:
         st.session_state.ml_preds = ml_preds
 
         engine = StreamingEngine()
-        st.session_state.sim_th = engine.simulate(ts, method='threshold')
-        st.session_state.sim_ml = engine.simulate(ts, method='ml', predictions=ml_preds)
+        st.session_state.sim_rule = engine.simulate(ts, method='rule')
+        st.session_state.sim_th   = engine.simulate(ts, method='threshold')
+        st.session_state.sim_ml   = engine.simulate(ts, method='ml', predictions=ml_preds)
         st.success("Simulation complete.")
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
@@ -138,8 +142,8 @@ with tabs[0]:
     |------|--------|-------------|
     | 1 | **Network Simulator** | Generates synthetic mobile network traces (throughput, latency, packet loss, jitter, signal strength, mobility speed) for three congestion levels |
     | 2 | **ML Classifier** | Trains K-Nearest Neighbours and Random Forest models to predict network congestion class from raw measurements |
-    | 3 | **Streaming Engine** | Simulates an ABR video session using (a) simple threshold rules and (b) ML-predicted congestion class |
-    | 4 | **Performance Evaluator** | Compares both methods across rebuffering events, average quality, quality stability, and adaptation accuracy |
+    | 3 | **Streaming Engine** | Simulates an ABR video session. Both controllers consume the same throughput estimate (harmonic mean over a sliding window). The ML method additionally scales that estimate by a class-conditional safety factor (low=1.00, medium=0.80, high=0.60) — when the classifier predicts congestion, the controller picks more conservatively |
+    | 4 | **Performance Evaluator** | Compares both methods across rebuffering events, average quality, quality stability, and adaptation accuracy. Includes multi-seed statistical analysis |
 
     ### Network parameters modelled
     """)
@@ -301,27 +305,41 @@ with tabs[2]:
         # ── LSTM (optional) ──
         if lstm_available():
             st.subheader("LSTM — Time-Series Classifier")
-            if st.session_state.dataset is not None:
-                lstm_epochs = st.slider("LSTM epochs", 5, 50, 20, 5)
-                lstm_window = st.slider("LSTM window (time steps)", 5, 30, 10, 5)
-                if st.button("Train LSTM", type="primary"):
-                    from src.ml_classifier import LSTMClassifier
-                    lstm_clf = LSTMClassifier(window=lstm_window, epochs=lstm_epochs)
-                    with st.spinner("Training LSTM …"):
-                        lstm_res = lstm_clf.train(st.session_state.dataset)
-                    st.success(
-                        f"LSTM — Accuracy: {lstm_res['accuracy']:.3f}  |  "
-                        f"F1 Macro: {lstm_res['f1_macro']:.3f}"
+            st.caption(
+                "Trained on a **stitched time-series** (multiple distinct "
+                "scenario seeds concatenated) — not the shuffled i.i.d. "
+                "dataset, which has no meaningful temporal order."
+            )
+            lstm_epochs    = st.slider("LSTM epochs", 5, 50, 20, 5)
+            lstm_window    = st.slider("LSTM window (time steps)", 5, 30, 10, 5)
+            lstm_segments  = st.slider("Training segments", 4, 16, 8, 2,
+                                        help="Each segment is a fresh time-series with a different scenario seed.")
+            lstm_seg_dur   = st.slider("Seconds per segment", 120, 600, 300, 60)
+            if st.button("Train LSTM", type="primary"):
+                from src.ml_classifier import LSTMClassifier
+                ns = NetworkSimulator()
+                with st.spinner("Generating training sequence …"):
+                    train_seq = ns.generate_training_sequence(
+                        n_segments=lstm_segments,
+                        segment_duration=lstm_seg_dur,
                     )
-                    cm = lstm_res['confusion_matrix']
-                    fig_lstm = px.imshow(
-                        cm, text_auto=True, x=CLASSES, y=CLASSES,
-                        color_continuous_scale='Blues',
-                        labels={'x': 'Predicted', 'y': 'Actual'},
-                        title='LSTM Confusion Matrix',
-                    )
-                    fig_lstm.update_layout(height=320, coloraxis_showscale=False)
-                    st.plotly_chart(fig_lstm, use_container_width=True)
+                lstm_clf = LSTMClassifier(window=lstm_window, epochs=lstm_epochs)
+                with st.spinner(f"Training LSTM on {len(train_seq)} time-steps …"):
+                    lstm_res = lstm_clf.train(train_seq)
+                st.success(
+                    f"LSTM — Accuracy: {lstm_res['accuracy']:.3f}  |  "
+                    f"F1 Macro: {lstm_res['f1_macro']:.3f}  |  "
+                    f"Trained on {len(train_seq)} steps."
+                )
+                cm = lstm_res['confusion_matrix']
+                fig_lstm = px.imshow(
+                    cm, text_auto=True, x=CLASSES, y=CLASSES,
+                    color_continuous_scale='Blues',
+                    labels={'x': 'Predicted', 'y': 'Actual'},
+                    title='LSTM Confusion Matrix',
+                )
+                fig_lstm.update_layout(height=320, coloraxis_showscale=False)
+                st.plotly_chart(fig_lstm, use_container_width=True)
         else:
             st.info("Install TensorFlow to enable the LSTM classifier.")
 
@@ -334,67 +352,115 @@ with tabs[3]:
     if st.session_state.sim_th is None:
         st.info("Run a simulation from the sidebar first.")
     else:
-        ts     = st.session_state.ts
-        sim_th = st.session_state.sim_th
-        sim_ml = st.session_state.sim_ml
+        ts       = st.session_state.ts
+        sim_rule = st.session_state.sim_rule
+        sim_th   = st.session_state.sim_th
+        sim_ml   = st.session_state.sim_ml
 
         # Quick metrics
-        m_th = compute_metrics(sim_th)
-        m_ml = compute_metrics(sim_ml)
+        m_rule = compute_metrics(sim_rule)
+        m_th   = compute_metrics(sim_th)
+        m_ml   = compute_metrics(sim_ml)
 
-        def _delta(val_ml, val_th, lower_better=True):
-            delta = val_ml - val_th
-            if lower_better:
-                css = "better" if delta < 0 else ("worse" if delta > 0 else "neutral")
-            else:
-                css = "better" if delta > 0 else ("worse" if delta < 0 else "neutral")
-            sign = "+" if delta > 0 else ""
-            return f'<span class="{css}">{sign}{delta:.2f}</span>'
+        # ── QoE headline (primary win condition) ──────────────────────────────
+        st.subheader("QoE Score  *(avg bitrate − α·rebuffer_secs − β·switches)*")
+        st.caption("α = 0.3 Mbps/s (stall penalty), β = 0.02 Mbps/switch (smoothness penalty). Higher is better.")
+        qoe_rule, qoe_th, qoe_ml = st.columns(3)
+        with qoe_rule:
+            st.metric("Rule-Based QoE", f"{m_rule['qoe_score']:.3f} Mbps-eq.")
+        with qoe_th:
+            st.metric("Rate-Based QoE", f"{m_th['qoe_score']:.3f} Mbps-eq.",
+                      delta=round(m_th['qoe_score'] - m_rule['qoe_score'], 3))
+        with qoe_ml:
+            st.metric("ML-Based QoE",  f"{m_ml['qoe_score']:.3f} Mbps-eq.",
+                      delta=round(m_ml['qoe_score'] - m_rule['qoe_score'], 3))
 
-        col_th, col_ml = st.columns(2)
+        st.divider()
+
+        # ── Supporting metrics ────────────────────────────────────────────────
+        col_rule, col_th, col_ml = st.columns(3)
+        with col_rule:
+            st.markdown("#### Rule-Based  \n*(naive threshold rule — proposal baseline)*")
+            st.metric("Avg Bitrate",          f"{m_rule['avg_bitrate_mbps']:.3f} Mbps")
+            st.metric("Rebuffering Events",   m_rule['rebuffer_events'])
+            st.metric("Rebuffering Duration", f"{m_rule['rebuffer_secs']}s")
+            st.metric("Quality Switches",     m_rule['quality_switches'])
+            st.metric("Mean Quality Index",   f"{m_rule['mean_quality_idx']:.2f} / 3")
+            st.metric("Adaptation Accuracy",  f"{m_rule['adapt_accuracy']*100:.1f}%")
+
         with col_th:
-            st.markdown("#### Threshold-Based")
-            st.metric("Rebuffering Events",   m_th['rebuffer_events'])
-            st.metric("Rebuffering Duration", f"{m_th['rebuffer_secs']}s")
-            st.metric("Quality Switches",     m_th['quality_switches'])
-            st.metric("Mean Quality Index",   f"{m_th['mean_quality_idx']:.2f} / 3")
-            st.metric("Adaptation Accuracy",  f"{m_th['adapt_accuracy']*100:.1f}%")
+            st.markdown("#### Rate-Based  \n*(harmonic-mean estimator)*")
+            st.metric("Avg Bitrate",
+                      f"{m_th['avg_bitrate_mbps']:.3f} Mbps",
+                      delta=round(m_th['avg_bitrate_mbps'] - m_rule['avg_bitrate_mbps'], 3))
+            st.metric("Rebuffering Events",
+                      m_th['rebuffer_events'],
+                      delta=m_th['rebuffer_events'] - m_rule['rebuffer_events'],
+                      delta_color="inverse")
+            st.metric("Rebuffering Duration",
+                      f"{m_th['rebuffer_secs']}s",
+                      delta=m_th['rebuffer_secs'] - m_rule['rebuffer_secs'],
+                      delta_color="inverse")
+            st.metric("Quality Switches",
+                      m_th['quality_switches'],
+                      delta=m_th['quality_switches'] - m_rule['quality_switches'],
+                      delta_color="inverse")
+            st.metric("Mean Quality Index",
+                      f"{m_th['mean_quality_idx']:.2f} / 3",
+                      delta=round(m_th['mean_quality_idx'] - m_rule['mean_quality_idx'], 3))
+            st.metric("Adaptation Accuracy",
+                      f"{m_th['adapt_accuracy']*100:.1f}%",
+                      delta=f"{(m_th['adapt_accuracy'] - m_rule['adapt_accuracy'])*100:.1f}%")
 
         with col_ml:
-            st.markdown("#### ML-Based")
+            st.markdown("#### ML-Based  \n*(estimate × class safety factor)*")
+            st.metric("Avg Bitrate",
+                      f"{m_ml['avg_bitrate_mbps']:.3f} Mbps",
+                      delta=round(m_ml['avg_bitrate_mbps'] - m_rule['avg_bitrate_mbps'], 3))
             st.metric("Rebuffering Events",
                       m_ml['rebuffer_events'],
-                      delta=m_ml['rebuffer_events'] - m_th['rebuffer_events'],
+                      delta=m_ml['rebuffer_events'] - m_rule['rebuffer_events'],
                       delta_color="inverse")
             st.metric("Rebuffering Duration",
                       f"{m_ml['rebuffer_secs']}s",
-                      delta=m_ml['rebuffer_secs'] - m_th['rebuffer_secs'],
+                      delta=m_ml['rebuffer_secs'] - m_rule['rebuffer_secs'],
                       delta_color="inverse")
             st.metric("Quality Switches",
                       m_ml['quality_switches'],
-                      delta=m_ml['quality_switches'] - m_th['quality_switches'],
+                      delta=m_ml['quality_switches'] - m_rule['quality_switches'],
                       delta_color="inverse")
             st.metric("Mean Quality Index",
                       f"{m_ml['mean_quality_idx']:.2f} / 3",
-                      delta=round(m_ml['mean_quality_idx'] - m_th['mean_quality_idx'], 3))
+                      delta=round(m_ml['mean_quality_idx'] - m_rule['mean_quality_idx'], 3))
             st.metric("Adaptation Accuracy",
                       f"{m_ml['adapt_accuracy']*100:.1f}%",
-                      delta=f"{(m_ml['adapt_accuracy'] - m_th['adapt_accuracy'])*100:.1f}%")
+                      delta=f"{(m_ml['adapt_accuracy'] - m_rule['adapt_accuracy'])*100:.1f}%")
+        st.caption("Δ values compare each controller against the **Rule-Based** baseline (the proposal's traditional threshold method).")
 
         st.divider()
 
         # Network throughput timeline
         st.plotly_chart(plot_throughput(ts), use_container_width=True)
 
+        # Estimator signal (actual vs effective for all three methods)
+        st.plotly_chart(plot_estimator(sim_th, sim_ml, sim_rule),
+                        use_container_width=True)
+
         # Quality timelines
-        st.plotly_chart(plot_quality_timeline(sim_th, sim_ml), use_container_width=True)
+        st.plotly_chart(plot_quality_timeline(sim_th, sim_ml, sim_rule),
+                        use_container_width=True)
 
         # Buffer levels
-        st.plotly_chart(plot_buffer(sim_th, sim_ml), use_container_width=True)
+        st.plotly_chart(plot_buffer(sim_th, sim_ml, sim_rule),
+                        use_container_width=True)
 
         with st.expander("Raw simulation data"):
-            view = st.radio("Show data for:", ['Threshold', 'ML-Based'], horizontal=True)
-            df_show = sim_th if view == 'Threshold' else sim_ml
+            view = st.radio("Show data for:",
+                            ['Rule-Based', 'Rate-Based', 'ML-Based'],
+                            horizontal=True)
+            df_show = {'Rule-Based': sim_rule,
+                       'Rate-Based': sim_th,
+                       'ML-Based':   sim_ml}[view]
             st.dataframe(df_show, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,9 +472,10 @@ with tabs[4]:
     if st.session_state.sim_th is None:
         st.info("Run a simulation from the sidebar first.")
     else:
-        sim_th = st.session_state.sim_th
-        sim_ml = st.session_state.sim_ml
-        metrics = compare(sim_th, sim_ml)
+        sim_rule = st.session_state.sim_rule
+        sim_th   = st.session_state.sim_th
+        sim_ml   = st.session_state.sim_ml
+        metrics  = compare(sim_th, sim_ml, sim_rule)
 
         st.plotly_chart(plot_comparison_bars(metrics), use_container_width=True)
         st.plotly_chart(plot_quality_distribution(metrics), use_container_width=True)
@@ -416,6 +483,8 @@ with tabs[4]:
         st.subheader("Metric Table")
         metric_rows = []
         for key, label in [
+            ('qoe_score',        'QoE Score (Mbps-eq.) (↑ headline)'),
+            ('avg_bitrate_mbps', 'Avg Bitrate (Mbps)   (↑ better)'),
             ('rebuffer_events',  'Rebuffering Events   (↓ better)'),
             ('rebuffer_secs',    'Rebuffering Dur. (s) (↓ better)'),
             ('quality_switches', 'Quality Switches     (↓ better)'),
@@ -423,48 +492,136 @@ with tabs[4]:
             ('adapt_accuracy',   'Adaptation Accuracy %(↑ better)'),
             ('quality_mismatch', 'Quality Mismatch     (↓ better)'),
         ]:
-            th_val = metrics['Threshold'][key]
-            ml_val = metrics['ML-Based'][key]
-            metric_rows.append({'Metric': label,
-                                 'Threshold': th_val,
-                                 'ML-Based':  ml_val})
+            metric_rows.append({
+                'Metric':     label,
+                'Rule-Based': metrics['Rule-Based'][key],
+                'Rate-Based': metrics['Threshold'][key],
+                'ML-Based':   metrics['ML-Based'][key],
+            })
         st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
-        # Narrative conclusion
-        st.subheader("Analysis")
-        m_th = metrics['Threshold']
-        m_ml = metrics['ML-Based']
+        # Narrative conclusion — primary contrast is ML vs Rule-Based,
+        # which is what the proposal asks the project to demonstrate.
+        st.subheader("Analysis — ML vs Rule-Based (proposal contrast)")
+        m_rule = metrics['Rule-Based']
+        m_ml   = metrics['ML-Based']
 
-        rb_diff    = m_th['rebuffer_events'] - m_ml['rebuffer_events']
-        sw_diff    = m_th['quality_switches'] - m_ml['quality_switches']
-        acc_diff   = m_ml['adapt_accuracy'] - m_th['adapt_accuracy']
-        qual_diff  = m_ml['mean_quality_idx'] - m_th['mean_quality_idx']
+        qoe_diff   = m_ml['qoe_score']          - m_rule['qoe_score']
+        rb_diff    = m_rule['rebuffer_events']   - m_ml['rebuffer_events']
+        sw_diff    = m_rule['quality_switches']  - m_ml['quality_switches']
+        acc_diff   = m_ml['adapt_accuracy']      - m_rule['adapt_accuracy']
+        qual_diff  = m_ml['mean_quality_idx']    - m_rule['mean_quality_idx']
 
         lines = []
+        # QoE headline — always shown first
+        if qoe_diff > 0:
+            lines.append(
+                f"- **QoE: ML-Based scores +{qoe_diff:.3f} Mbps-equivalent higher** "
+                f"({m_ml['qoe_score']:.3f} vs {m_rule['qoe_score']:.3f}), "
+                "the primary performance win."
+            )
+        elif qoe_diff < 0:
+            lines.append(
+                f"- **QoE: Rule-Based scores +{-qoe_diff:.3f} Mbps-equivalent higher** "
+                f"({m_rule['qoe_score']:.3f} vs {m_ml['qoe_score']:.3f}) in this run."
+            )
+        else:
+            lines.append("- **QoE: Both methods achieved the same score** in this run.")
+
+        # Supporting breakdown
         if rb_diff > 0:
             lines.append(f"- ML-Based caused **{rb_diff} fewer rebuffering events**, improving playback continuity.")
         elif rb_diff < 0:
-            lines.append(f"- Threshold caused **{-rb_diff} fewer rebuffering events** in this run.")
+            lines.append(f"- The rule baseline caused **{-rb_diff} fewer rebuffering events** in this run.")
         else:
             lines.append("- Both methods experienced the same number of rebuffering events.")
 
         if sw_diff > 0:
             lines.append(f"- ML-Based made **{sw_diff} fewer quality switches**, indicating higher bitrate stability.")
         elif sw_diff < 0:
-            lines.append(f"- Threshold made **{-sw_diff} fewer quality switches** in this run.")
+            lines.append(f"- The rule baseline made **{-sw_diff} fewer quality switches** in this run.")
 
         if acc_diff > 0:
             lines.append(f"- ML-Based matched the optimal quality **{acc_diff:.1f}% more often**.")
         else:
-            lines.append(f"- Threshold matched optimal quality **{-acc_diff:.1f}% more often** in this run.")
+            lines.append(f"- The rule baseline matched the optimal quality **{-acc_diff:.1f}% more often** in this run.")
 
         if qual_diff > 0:
             lines.append(f"- ML-Based delivered a higher average quality index (+{qual_diff:.2f} steps).")
         elif qual_diff < 0:
-            lines.append(f"- Threshold delivered a slightly higher average quality index.")
+            lines.append(f"- The rule baseline delivered a slightly higher average quality index.")
 
         st.markdown("\n".join(lines))
         st.caption(
+            "QoE = avg_bitrate_mbps − 0.3 × rebuffer_secs − 0.02 × quality_switches. "
             "Results vary with random seed, duration, and model accuracy. "
-            "Re-run with different seeds for statistical robustness."
+            "Use the Multi-Seed Analysis below to test statistical robustness."
         )
+
+        # ─── Multi-seed statistical analysis ───
+        st.divider()
+        st.subheader("📐 Statistical Robustness — Multi-Seed Analysis")
+        st.markdown(
+            "A single run's verdict can flip on a different seed. "
+            "Run **N independent simulations** with different network seeds and "
+            "compare *mean ± std* and *win-rates* per metric."
+        )
+
+        col_n, col_d = st.columns(2)
+        with col_n:
+            n_runs = st.slider("Number of runs", 5, 50, 20, 5, key="ms_n_runs")
+        with col_d:
+            duration_runs = st.slider("Duration per run (s)", 60, 300, 180, 30, key="ms_dur")
+
+        if st.button("Run Multi-Seed Analysis", type="primary", key="ms_btn"):
+            progress = st.progress(0.0, text="Running simulations …")
+            df_runs = run_multi_seed(
+                st.session_state.classifier,
+                n_runs=n_runs,
+                duration=duration_runs,
+                ml_model_name=ml_model_name,
+                progress_callback=lambda p: progress.progress(p,
+                    text=f"Running simulations … {int(p*100)}%"),
+            )
+            st.session_state.multi_seed_df = df_runs
+            st.session_state.multi_seed_n = n_runs
+            st.session_state.multi_seed_dur = duration_runs
+            progress.empty()
+
+        if st.session_state.multi_seed_df is not None:
+            df_runs = st.session_state.multi_seed_df
+            st.caption(
+                f"Showing results from {st.session_state.multi_seed_n} runs "
+                f"of {st.session_state.multi_seed_dur}s each."
+            )
+
+            st.plotly_chart(plot_multi_seed_bars(df_runs), use_container_width=True)
+
+            ms_baseline = st.radio(
+                "Win-rate baseline (compare ML against):",
+                ['Rule-Based', 'Threshold'],
+                horizontal=True,
+                key="ms_win_baseline",
+                help="Rule-Based = naive threshold rule (proposal baseline). "
+                     "Threshold = stronger rate-based ABR controller.",
+            )
+            st.markdown(
+                f"**Win-Rate Table** — out of N runs, how often ML beats "
+                f"the **{ms_baseline}** controller per metric:"
+            )
+            st.dataframe(compute_win_rates(df_runs, baseline=ms_baseline),
+                         use_container_width=True, hide_index=True)
+
+            box_metric = st.selectbox(
+                "Distribution view — pick a metric:",
+                ['qoe_score', 'avg_bitrate_mbps', 'rebuffer_events', 'rebuffer_secs',
+                 'quality_switches', 'mean_quality_idx', 'adapt_accuracy', 'quality_mismatch'],
+                key="ms_box_metric",
+            )
+            st.plotly_chart(
+                plot_multi_seed_distribution(df_runs, box_metric),
+                use_container_width=True,
+            )
+
+            with st.expander("Per-run raw metrics"):
+                st.dataframe(df_runs, use_container_width=True, hide_index=True)

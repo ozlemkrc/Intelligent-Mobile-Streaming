@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 import pandas as pd
 
@@ -11,98 +13,140 @@ QUALITY_LEVELS = {
 }
 QUALITY_ORDER = ['240p', '480p', '720p', '1080p']
 
-# Throughput thresholds (Mbps) that trigger each quality step up
-THRESHOLDS = {
-    '1080p': 4.5,
-    '720p':  2.0,
-    '480p':  0.8,
-    # below 0.8 Mbps → 240p
-}
+# ML safety factors per predicted congestion class.
+# When the classifier predicts congestion, the throughput estimate is
+# trusted less, so the controller picks a more conservative quality.
+DEFAULT_SAFETY_FACTORS = {'low': 1.00, 'medium': 0.80, 'high': 0.60}
 
-# Congestion class → default quality (ML path)
-CONGESTION_TO_QUALITY = {
-    'low':    '1080p',
-    'medium': '720p',
-    'high':   '240p',
-}
+# Sliding window for the throughput estimator (seconds).
+DEFAULT_ESTIMATOR_WINDOW = 5
 
-MAX_BUFFER = 30.0    # seconds
-INIT_BUFFER = 5.0    # seconds
-RESUME_AT   = 2.0    # seconds of buffer needed to exit rebuffering
+# Standard QoE weights (Mbps-equivalent units).
+# Formula: QoE = avg_bitrate_mbps − α·rebuffer_secs − β·quality_switches
+# α: each second of stall costs the equivalent of 0.3 Mbps of average quality.
+# β: each quality switch costs 0.02 Mbps (smoothness penalty).
+QOE_ALPHA = 0.3
+QOE_BETA  = 0.02
 
-
-def _threshold_select(throughput_mbps: float) -> str:
-    if throughput_mbps >= THRESHOLDS['1080p']:
-        return '1080p'
-    if throughput_mbps >= THRESHOLDS['720p']:
-        return '720p'
-    if throughput_mbps >= THRESHOLDS['480p']:
-        return '480p'
-    return '240p'
+# Naive threshold rule (proposal's "traditional threshold-based" baseline).
+# Maps the most recent observed throughput directly to a quality bucket
+# without any smoothing, estimation, or learned signal. This is the
+# textbook rule-based ABR controller the ML method is meant to beat.
+RULE_THRESHOLDS = [
+    (0.5,  '240p'),
+    (1.5,  '480p'),
+    (3.5,  '720p'),
+]
 
 
-def _optimal_quality(throughput_mbps: float) -> str:
-    """Best quality that can be sustained without buffer drain."""
-    throughput_kbps = throughput_mbps * 1000
+def _rule_quality(last_throughput_mbps: float) -> str:
+    for thresh, q in RULE_THRESHOLDS:
+        if last_throughput_mbps < thresh:
+            return q
+    return '1080p'
+
+# Buffer model
+MAX_BUFFER  = 30.0
+INIT_BUFFER = 5.0
+RESUME_AT   = 2.0
+
+
+class ThroughputEstimator:
+    """Harmonic mean over a sliding window — standard ABR practice
+    (dash.js, Pensieve baseline). Harmonic mean is conservative under
+    variance: a single low sample pulls the estimate down sharply."""
+
+    def __init__(self, window: int = DEFAULT_ESTIMATOR_WINDOW):
+        self.window = window
+        self.history: deque = deque(maxlen=window)
+
+    def observe(self, throughput_mbps: float) -> None:
+        self.history.append(max(throughput_mbps, 0.01))
+
+    def estimate(self) -> float:
+        if not self.history:
+            return 1.0  # cold-start fallback
+        return len(self.history) / sum(1.0 / x for x in self.history)
+
+
+def _select_quality_under(effective_mbps: float) -> str:
+    """Highest quality whose bitrate fits under the given effective throughput."""
+    effective_kbps = effective_mbps * 1000
     for q in reversed(QUALITY_ORDER):
-        if throughput_kbps >= QUALITY_LEVELS[q]:
+        if QUALITY_LEVELS[q] <= effective_kbps:
             return q
     return '240p'
 
 
+def _optimal_quality(throughput_mbps: float) -> str:
+    """Oracle: best quality with perfect knowledge of the current throughput."""
+    return _select_quality_under(throughput_mbps)
+
+
 class StreamingEngine:
-    """Simulates an ABR streaming session over a network time series."""
+    """Simulates an ABR streaming session over a network time series.
+
+    Both methods consume the same throughput-estimate signal (harmonic mean
+    of the last `estimator_window` observed seconds). The ML method
+    additionally scales the estimate by a class-conditional safety factor
+    derived from the predicted congestion state.
+    """
 
     def simulate(
         self,
         ts: pd.DataFrame,
         method: str = 'threshold',
         predictions: np.ndarray | None = None,
+        estimator_window: int = DEFAULT_ESTIMATOR_WINDOW,
+        safety_factors: dict | None = None,
     ) -> pd.DataFrame:
-        """
-        Run one streaming session.
+        if safety_factors is None:
+            safety_factors = DEFAULT_SAFETY_FACTORS
 
-        Parameters
-        ----------
-        ts          : time-series DataFrame from NetworkSimulator
-        method      : 'threshold' or 'ml'
-        predictions : array of congestion class strings (required when method='ml')
-
-        Returns a per-second DataFrame with simulation state columns.
-        """
         n = len(ts)
         records = []
+        estimator = ThroughputEstimator(window=estimator_window)
 
         buffer = INIT_BUFFER
-        current_quality = '480p'
+        current_quality = '240p'   # safe cold start
         is_rebuffering = False
         rebuffer_events = 0
         rebuffer_seconds = 0
         quality_switches = 0
-        last_switch_t = -1
+        last_throughput = 1.0  # rule-method cold-start observation
 
         for t in range(n):
             row = ts.iloc[t]
             throughput_mbps = float(row['throughput_dl'])
             throughput_kbps = throughput_mbps * 1000
 
-            # --- Select quality ---
-            if method == 'threshold':
-                target = _threshold_select(throughput_mbps)
+            # ── Quality decision (uses PRIOR observations only) ──
+            estimate = estimator.estimate()
+            if method == 'rule':
+                # Naive threshold rule: pick quality bucket directly from
+                # the most recent observed throughput. No smoothing.
+                effective = last_throughput
+                pred_label = ''
+                target = _rule_quality(last_throughput)
+            elif method == 'threshold':
+                effective = estimate
+                pred_label = ''
+                target = _select_quality_under(effective)
             else:
-                pred = predictions[t] if predictions is not None else 'medium'
-                target = CONGESTION_TO_QUALITY.get(pred, '720p')
+                pred_label = predictions[t] if predictions is not None else 'medium'
+                sf = safety_factors.get(pred_label, 0.8)
+                effective = estimate * sf
+                target = _select_quality_under(effective)
 
             if target != current_quality:
                 quality_switches += 1
-                last_switch_t = t
                 current_quality = target
 
             bitrate_kbps = QUALITY_LEVELS[current_quality]
             optimal = _optimal_quality(throughput_mbps)
 
-            # --- Buffer dynamics ---
-            fill_rate = throughput_kbps / bitrate_kbps   # seconds of video per second
+            # ── Buffer dynamics (uses ACTUAL throughput) ──
+            fill_rate = throughput_kbps / bitrate_kbps
 
             if is_rebuffering:
                 rebuffer_seconds += 1
@@ -110,24 +154,32 @@ class StreamingEngine:
                 if buffer >= RESUME_AT:
                     is_rebuffering = False
             else:
-                buffer = buffer + fill_rate - 1.0        # play 1s, download fill_rate s
+                buffer = buffer + fill_rate - 1.0
                 buffer = max(0.0, min(MAX_BUFFER, buffer))
                 if buffer <= 0.0:
                     is_rebuffering = True
                     rebuffer_events += 1
 
+            # Observe AFTER the decision (causal: the controller can only
+            # use throughput it has already seen).
+            estimator.observe(throughput_mbps)
+            last_throughput = throughput_mbps
+
             records.append({
-                'time':            t,
-                'throughput_mbps': throughput_mbps,
-                'congestion_true': row.get('congestion_true', ''),
-                'quality':         current_quality,
-                'quality_kbps':    bitrate_kbps,
-                'optimal_quality': optimal,
-                'buffer_s':        round(buffer, 3),
-                'rebuffering':     is_rebuffering,
-                'rebuffer_events': rebuffer_events,
-                'rebuffer_secs':   rebuffer_seconds,
-                'quality_switches': quality_switches,
+                'time':              t,
+                'throughput_mbps':   throughput_mbps,
+                'throughput_est':    round(estimate, 3),
+                'effective_mbps':    round(effective, 3),
+                'congestion_true':   row.get('congestion_true', ''),
+                'predicted_class':   pred_label,
+                'quality':           current_quality,
+                'quality_kbps':      bitrate_kbps,
+                'optimal_quality':   optimal,
+                'buffer_s':          round(buffer, 3),
+                'rebuffering':       is_rebuffering,
+                'rebuffer_events':   rebuffer_events,
+                'rebuffer_secs':     rebuffer_seconds,
+                'quality_switches':  quality_switches,
             })
 
         return pd.DataFrame(records)
@@ -136,28 +188,21 @@ class StreamingEngine:
 def compute_metrics(sim: pd.DataFrame) -> dict:
     """Aggregate quality and stability metrics from a simulation DataFrame."""
     q_map = {q: i for i, q in enumerate(QUALITY_ORDER)}
-
     q_indices = sim['quality'].map(q_map)
     opt_indices = sim['optimal_quality'].map(q_map)
-
-    # Fraction of time at each quality level
     q_dist = sim['quality'].value_counts(normalize=True).to_dict()
-
-    # Mean quality index (higher = better)
-    mean_q = q_indices.mean()
-
-    # Adaptation accuracy: fraction of steps where selected == optimal
-    adapt_acc = (sim['quality'] == sim['optimal_quality']).mean()
-
-    # Quality mismatch: mean absolute difference in quality steps
-    q_mismatch = (q_indices - opt_indices).abs().mean()
-
+    avg_bitrate_mbps = round(float(sim['quality_kbps'].mean()) / 1000, 3)
+    rebuf_secs = int(sim['rebuffer_secs'].iloc[-1])
+    switches   = int(sim['quality_switches'].iloc[-1])
+    qoe = round(avg_bitrate_mbps - QOE_ALPHA * rebuf_secs - QOE_BETA * switches, 3)
     return {
-        'rebuffer_events': int(sim['rebuffer_events'].iloc[-1]),
-        'rebuffer_secs': int(sim['rebuffer_secs'].iloc[-1]),
-        'quality_switches': int(sim['quality_switches'].iloc[-1]),
-        'mean_quality_idx': round(float(mean_q), 3),
-        'adapt_accuracy': round(float(adapt_acc), 3),
-        'quality_mismatch': round(float(q_mismatch), 3),
+        'qoe_score':            qoe,
+        'avg_bitrate_mbps':     avg_bitrate_mbps,
+        'rebuffer_events':      int(sim['rebuffer_events'].iloc[-1]),
+        'rebuffer_secs':        rebuf_secs,
+        'quality_switches':     switches,
+        'mean_quality_idx':     round(float(q_indices.mean()), 3),
+        'adapt_accuracy':       round(float((sim['quality'] == sim['optimal_quality']).mean()), 3),
+        'quality_mismatch':     round(float((q_indices - opt_indices).abs().mean()), 3),
         'quality_distribution': {q: round(q_dist.get(q, 0), 3) for q in QUALITY_ORDER},
     }

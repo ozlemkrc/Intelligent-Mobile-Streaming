@@ -103,3 +103,22 @@ class NetworkSimulator:
         for feat in self.FEATURES:
             df[feat] = df[feat].ewm(span=3).mean()
         return df.reset_index(drop=True)
+
+    def generate_training_sequence(
+        self,
+        n_segments: int = 8,
+        segment_duration: int = 300,
+        base_seed: int = 100,
+    ) -> pd.DataFrame:
+        """Stitch multiple distinct time-series together for sequential
+        models (LSTM). Each segment uses a different seed so the model
+        sees varied scenario orderings, not a single deterministic loop."""
+        frames = []
+        cursor = 0
+        for i in range(n_segments):
+            seg = self.generate_time_series(segment_duration, base_seed + i)
+            seg = seg.copy()
+            seg['time'] = seg['time'] + cursor
+            cursor += segment_duration
+            frames.append(seg)
+        return pd.concat(frames, ignore_index=True)
