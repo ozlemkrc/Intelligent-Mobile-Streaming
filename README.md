@@ -8,15 +8,45 @@ controlled cross-user experiment.
 
 ---
 
-## Setup
+## Setup & run
+
+React + Vite (`frontend/`) + FastAPI API (`backend/main.py`)
+
+### 0) Python dependencies
 
 ```bash
+python -m venv .venv
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
-streamlit run app.py
 ```
 
-`torch` is the only new hard dependency.  CPU inference is used by default;
-if a CUDA GPU is present PyTorch will use it automatically.
+### Web dashboard (React + FastAPI)
+
+**1) Start the backend API**
+
+```bash
+uvicorn backend.main:app --reload --port 8000
+```
+
+API docs: http://localhost:8000/docs
+
+**2) Start the frontend UI** (requires Node.js 18+)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open: http://localhost:5173
+
+The dev server proxies `/api/*` → `http://localhost:8000` (see `frontend/vite.config.ts`).
+
+
+Notes:
+- `torch` is the heaviest dependency; CPU inference is used by default and CUDA is used automatically if available.
 
 ---
 
@@ -51,16 +81,17 @@ latency            =  lat_min + (lat_max − lat_min) × load²
 packet_loss        =  (1 − SINR_factor)² × 14  +  load³ × 10
 ```
 
-**Congestion labels are derived from the physics**, not pre-assigned:
+**Congestion labels are derived from physics + a hidden temporal component**, not pre-assigned buckets:
 
 ```
-score = 0.45 × (1 − SINR_factor) + 0.55 × effective_load
-low   if score < 0.28
-medium if score < 0.52
-high  otherwise
+inst_score  = 0.45 × (1 − SINR_factor) + 0.55 × effective_load
+hidden_load = OU process mean-reverting toward inst_score  (persona-specific speed/volatility)
+
+label_score = 0.62 × inst_score + 0.38 × hidden_load + Normal(0, 0.04)
+labels      = low / medium / high via fuzzy thresholds (0.24, 0.55) with overlap band ±0.07
 ```
 
-This means class boundaries are realistically fuzzy and vary by user.
+This yields realistically overlapping classes and rewards sequence models (LSTM) over snapshot classifiers (KNN).
 
 ### Why per-user training matters
 
@@ -123,7 +154,7 @@ Expected outcome (typical run):
 │ PersonaDataGenerator  (src/persona_generator.py)         │
 │  ├─ 5 PersonaProfile  (3 LocationProfile each)           │
 │  ├─ Time-of-day cell load curve (24 empirical values)    │
-│  ├─ AR(1) temporal smoothing  (α = 0.72)                 │
+│  ├─ Per-feature AR(1) temporal smoothing                 │
 │  └─ Handoff injection in mobile locations                │
 └────────────────────┬────────────────────────────────────┘
                      │  per-user DataFrames
@@ -151,18 +182,20 @@ Expected outcome (typical run):
 
 ---
 
-## File structure
+## Repository structure
 
 ```
-├── app.py                        Streamlit dashboard (6 tabs)
-├── requirements.txt
-├── src/
-│   ├── persona_generator.py      Per-user spatiotemporal trace generator
-│   ├── personal_model.py         PyTorch LSTM + CrossUserEvaluator
-│   ├── network_simulator.py      Original i.i.d. simulator (kept for comparison)
-│   ├── ml_classifier.py          KNN / Random Forest baselines
-│   ├── streaming_engine.py       ABR simulation
-│   └── performance_evaluator.py  Metrics & Plotly charts
+├── backend/
+│   └── main.py                   FastAPI backend (serves `/api/*`)
+├── frontend/                     React + Vite dashboard (proxies `/api` to :8000)
+├── app.py                        Streamlit dashboard (optional)
+├── requirements.txt              Python dependencies
+└── src/
+    ├── persona_generator.py      Per-user spatiotemporal trace generator
+    ├── personal_model.py         PyTorch LSTM + CrossUserEvaluator
+    ├── ml_classifier.py          KNN / Random Forest baselines
+    ├── streaming_engine.py       ABR simulation + QoE metrics
+    └── performance_evaluator.py  Metrics & Plotly chart helpers
 ```
 
 ---
@@ -171,12 +204,12 @@ Expected outcome (typical run):
 
 | Tab | Description |
 |-----|-------------|
-| Overview | System diagram and quick-start guide |
-| Network Data | Explore the original i.i.d. dataset distributions |
-| ML Training | Train KNN / Random Forest on the i.i.d. dataset |
-| Streaming | Run ABR simulation; compare rule vs rate vs ML |
+| Overview | System overview and usage guide |
+| Persona Data | Generate per-user traces and explore distributions |
+| Model Training | Train Personal LSTM + KNN/RF baselines; view metrics |
+| Streaming | Run ABR simulation; compare rule vs threshold vs ML-assisted |
 | Comparison | Multi-seed statistical analysis and win-rate table |
-| **Persona AI** | Generate per-user data; run cross-user experiment |
+| Cross-User | Personal vs generic model experiment (personalisation proof) |
 
 ---
 

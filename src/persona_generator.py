@@ -517,6 +517,13 @@ class PersonaDataGenerator:
         _handoff_interval = 90
         _handoff_check_p  = 0.15
 
+        # Deep fade state: simulates tunnel / indoor blackout periods.
+        # Probability ~1/200 per step → ~1–2 fades per 300-step session.
+        _FADE_PROB       = 1 / 200
+        _FADE_DL_MBPS    = 0.02   # 20 kbps — well below 240p (300 kbps)
+        _FADE_UL_MBPS    = 0.008
+        fade_countdown   = 0
+
         # --- Hidden OU congestion process ---
         # Initialise from the starting location's physics so the hidden state
         # is already meaningful at step 0 instead of burning in from 0.5.
@@ -602,6 +609,17 @@ class PersonaDataGenerator:
             smoothed['hour']     = round(hour, 4)
             smoothed['location'] = loc_key
             smoothed['persona']  = persona_key
+
+            # --- Deep fade override ---
+            if fade_countdown > 0:
+                fade_countdown -= 1
+            elif rng.random() < _FADE_PROB:
+                fade_countdown = int(rng.integers(12, 26))
+            if fade_countdown > 0:
+                smoothed['throughput_dl'] = _FADE_DL_MBPS
+                smoothed['throughput_ul'] = _FADE_UL_MBPS
+                smoothed['congestion_true'] = 'high'
+
             rows.append(smoothed)
             prev = {k: smoothed[k] for k in raw}
 

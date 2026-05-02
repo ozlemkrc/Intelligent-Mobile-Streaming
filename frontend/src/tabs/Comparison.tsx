@@ -51,7 +51,7 @@ export function Comparison({ hasSimulation, activePersona }: Props) {
 
       {cmpData && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-4">
             <PlotlyChart figure={cmpData.bars} className="h-80" />
             <PlotlyChart figure={cmpData.distribution} className="h-80" />
           </div>

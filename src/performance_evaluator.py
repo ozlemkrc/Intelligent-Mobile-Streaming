@@ -194,11 +194,11 @@ def plot_throughput(ts: pd.DataFrame) -> go.Figure:
 def plot_comparison_bars(metrics: dict) -> go.Figure:
     # QoE is the headline metric (col 1); secondary metrics follow.
     bar_metrics = [
-        ('qoe_score',        'QoE Score (Mbps-eq.)',    True),
-        ('avg_bitrate_mbps', 'Avg Bitrate (Mbps)',      True),
-        ('rebuffer_secs',    'Rebuffering Duration (s)', False),
-        ('quality_switches', 'Quality Switches',         False),
-        ('mean_quality_idx', 'Mean Quality Index',       True),
+        ('qoe_score',        'QoE Score<br>(Mbps-eq.)',     True),
+        ('avg_bitrate_mbps', 'Avg Bitrate<br>(Mbps)',       True),
+        ('rebuffer_secs',    'Rebuffering<br>Duration (s)', False),
+        ('quality_switches', 'Quality<br>Switches',         False),
+        ('mean_quality_idx', 'Mean Quality<br>Index',       True),
     ]
     fig = make_subplots(
         rows=1, cols=len(bar_metrics),
@@ -213,6 +213,7 @@ def plot_comparison_bars(metrics: dict) -> go.Figure:
             ), row=1, col=col)
 
     # Bold the QoE subplot title to signal it is the headline metric.
+    fig.update_annotations(font=dict(size=11))
     fig.layout.annotations[0].update(font=dict(size=13, color='#cdd6f4'))
     fig.update_layout(height=370, title='Method Comparison — QoE (headline) + supporting metrics',
                       barmode='group')
