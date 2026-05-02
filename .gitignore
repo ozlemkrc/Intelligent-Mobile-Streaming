@@ -5,7 +5,6 @@ __pycache__/
 *.pyd
 .Python
 *.egg-info/
-dist/
 build/
 *.egg
 
@@ -44,6 +43,22 @@ Thumbs.db
 # Logs
 *.log
 
-
+# Misc
 *.pdf
 .claude/
+
+# Frontend
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# PyTorch checkpoints
+*.pt
+*.pth
