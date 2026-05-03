@@ -39,8 +39,30 @@ FEATURES = [
     'throughput_dl', 'throughput_ul', 'latency',
     'packet_loss', 'jitter', 'signal_strength', 'mobility_speed',
 ]
+
+# Video quality levels and their bitrate requirements (kbps)
+QUALITY_ORDER  = ['240p', '480p', '720p', '1080p']
+QUALITY_LEVELS = {'240p': 300, '480p': 1000, '720p': 2500, '1080p': 5000}
 # Sorted alphabetically — this is what LabelEncoder produces
-CLASSES = ['high', 'low', 'medium']
+CLASSES = sorted(QUALITY_ORDER)   # ['1080p', '240p', '480p', '720p']
+
+
+def _oracle_quality(throughput_mbps: float) -> str:
+    """Highest quality whose bitrate fits within the given throughput."""
+    kbps = throughput_mbps * 1000
+    for q in reversed(QUALITY_ORDER):
+        if QUALITY_LEVELS[q] <= kbps:
+            return q
+    return QUALITY_ORDER[0]
+
+
+def _compute_labels(throughputs: np.ndarray, horizon: int) -> np.ndarray:
+    """Look-ahead oracle: label[t] = best quality sustainable over next `horizon` steps."""
+    n = len(throughputs)
+    return np.array([
+        _oracle_quality(float(throughputs[t: min(t + horizon, n)].min()))
+        for t in range(n)
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +82,7 @@ class PersonalLSTM(nn.Module):
         input_dim:  int   = 7,
         hidden_dim: int   = 64,
         n_layers:   int   = 2,
-        n_classes:  int   = 3,
+        n_classes:  int   = 4,
         dropout:    float = 0.25,
     ):
         super().__init__()
@@ -99,6 +121,7 @@ class PersonalTrainer:
         epochs:       int   = 30,
         batch_size:   int   = 128,
         patience:     int   = 7,
+        horizon:      int   = 5,
         device:       Optional[str] = None,
     ):
         self.window       = window
@@ -109,6 +132,7 @@ class PersonalTrainer:
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.patience     = patience
+        self.horizon      = horizon
         self.device       = self._resolve_device(device)
 
         self.scaler = StandardScaler()
@@ -173,8 +197,10 @@ class PersonalTrainer:
         of the data acts as "future" observations the model has never seen.
         Returns a dict with training statistics.
         """
-        X_raw = df[FEATURES].values.astype(np.float64)
-        y_raw = self.le.transform(df[self._label_col(df)].values)
+        X_raw  = df[FEATURES].values.astype(np.float64)
+        y_raw  = self.le.transform(
+            _compute_labels(df['throughput_dl'].values, self.horizon)
+        )
 
         n         = len(X_raw)
         val_start = int(n * (1.0 - val_frac))
@@ -293,7 +319,7 @@ class PersonalTrainer:
         if self.model is None:
             raise RuntimeError("Call fit() before evaluate().")
         X = self.scaler.transform(df[FEATURES].values.astype(np.float64))
-        y = self.le.transform(df[self._label_col(df)].values)
+        y = self.le.transform(_compute_labels(df['throughput_dl'].values, self.horizon))
         Xs, ys = self._make_sequences(X, y)
         return self._eval_tensors(self._to_tensor(Xs), ys)
 

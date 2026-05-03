@@ -13,11 +13,6 @@ QUALITY_LEVELS = {
 }
 QUALITY_ORDER = ['240p', '480p', '720p', '1080p']
 
-# ML safety factors per predicted congestion class.
-# When the classifier predicts congestion, the throughput estimate is
-# trusted less, so the controller picks a more conservative quality.
-DEFAULT_SAFETY_FACTORS = {'low': 1.00, 'medium': 0.80, 'high': 0.60}
-
 # Sliding window for the throughput estimator (seconds).
 DEFAULT_ESTIMATOR_WINDOW = 5
 
@@ -86,10 +81,10 @@ def _optimal_quality(throughput_mbps: float) -> str:
 class StreamingEngine:
     """Simulates an ABR streaming session over a network time series.
 
-    Both methods consume the same throughput-estimate signal (harmonic mean
-    of the last `estimator_window` observed seconds). The ML method
-    additionally scales the estimate by a class-conditional safety factor
-    derived from the predicted congestion state.
+    Three controllers:
+    - rule      : naive threshold on the most recent throughput observation
+    - threshold : harmonic-mean estimate over a sliding window
+    - ml        : LSTM-predicted quality level used directly (no safety scaling)
     """
 
     def simulate(
@@ -98,10 +93,7 @@ class StreamingEngine:
         method: str = 'threshold',
         predictions: np.ndarray | None = None,
         estimator_window: int = DEFAULT_ESTIMATOR_WINDOW,
-        safety_factors: dict | None = None,
     ) -> pd.DataFrame:
-        if safety_factors is None:
-            safety_factors = DEFAULT_SAFETY_FACTORS
 
         n = len(ts)
         records = []
@@ -133,10 +125,12 @@ class StreamingEngine:
                 pred_label = ''
                 target = _select_quality_under(effective)
             else:
-                pred_label = predictions[t] if predictions is not None else 'medium'
-                sf = safety_factors.get(pred_label, 0.8)
-                effective = estimate * sf
-                target = _select_quality_under(effective)
+                # LSTM predicts quality level directly — use it as-is.
+                target = predictions[t] if predictions is not None else '480p'
+                if target not in QUALITY_LEVELS:
+                    target = '480p'
+                pred_label = target
+                effective  = QUALITY_LEVELS[target] / 1000.0
 
             if target != current_quality:
                 quality_switches += 1

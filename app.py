@@ -179,7 +179,7 @@ with tabs[0]:
     | Step | Module | Description |
     |------|--------|-------------|
     | 1 | **Persona Generator** | Five user archetypes, each with home / work / commute anchors. Metrics emerge from a capacity model coupling RSSI and cell load — labels are not pre-assigned |
-    | 2 | **Personal LSTM** | PyTorch 2-layer LSTM trained on *one user's* data. Learns that user's specific location fingerprints and schedule |
+    | 2 | **Personal LSTM** | PyTorch 2-layer LSTM trained on *one user's* data. Predicts video quality level (240p–1080p) directly using look-ahead labels derived from near-future throughput |
     | 3 | **KNN / RF baselines** | Scikit-learn classifiers trained on the same persona data for fair comparison |
     | 4 | **Streaming Engine** | Buffer-based ABR simulation comparing rule-based, rate-based, and ML-based controllers |
     | 5 | **Cross-User Experiment** | Proves personalisation: personal model vs generic model on each user's held-out test data |
@@ -332,7 +332,7 @@ with tabs[2]:
             st.plotly_chart(fig_loss, use_container_width=True)
 
         # LSTM evaluation on full dataset
-        st.subheader("LSTM — Evaluation on Full Persona Dataset")
+        st.subheader("LSTM — Quality Prediction on Full Persona Dataset")
         lstm_metrics = trainer.evaluate(df_train)
         lc1, lc2 = st.columns(2)
         lc1.metric("Accuracy", f"{lstm_metrics['accuracy']:.3f}")
@@ -356,7 +356,7 @@ with tabs[2]:
         summary_rows = []
         for name, r in clf.results.items():
             rep = r['report']
-            # label_names order matches LabelEncoder (alphabetical: high/low/medium)
+            # label_names order matches LabelEncoder (alphabetical: 1080p/240p/480p/720p)
             summary_rows.append({
                 'Model':    name,
                 'Accuracy': f"{r['accuracy']:.3f}",
@@ -419,7 +419,7 @@ with tabs[3]:
         for col, label, m in [
             (col_r, "Rule-Based  *(naive threshold)*",           m_r),
             (col_t, "Rate-Based  *(harmonic-mean estimate)*",    m_t),
-            (col_m, "Personal-ML  *(estimate × LSTM safety)*",  m_m),
+            (col_m, "Personal-ML  *(LSTM quality prediction)*",  m_m),
         ]:
             with col:
                 st.markdown(f"#### {label}")

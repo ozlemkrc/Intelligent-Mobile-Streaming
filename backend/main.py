@@ -29,10 +29,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ── In-memory state ────────────────────────────────────────────────────────────
 _state: dict[str, Any] = {
-    "persona_data": None,
-    "trainer": None,
-    "baseline_clf": None,
-    "active_persona": list(PERSONAS.keys())[0],
+    "persona_data":     None,
+    "trainer":          None,   # single-persona trainer (legacy / fallback)
+    "baseline_clf":     None,
+    "active_persona":   list(PERSONAS.keys())[0],
+    "persona_trainers": {},     # dict[persona_key -> PersonalTrainer]
+    "persona_metrics":  {},     # dict[persona_key -> metrics dict]
     "ts": None,
     "sim_rule": None, "sim_th": None, "sim_ml": None, "ml_preds": None,
     "multi_seed_df": None,
@@ -56,9 +58,10 @@ def _fig_json(fig) -> dict:
     return json.loads(fig.to_json())
 
 def _require(key: str, label: str):
-    if _state[key] is None:
+    v = _state.get(key)
+    if v is None:
         raise HTTPException(400, f"{label} not available yet.")
-    return _state[key]
+    return v
 
 def _to_python(obj):
     if isinstance(obj, np.integer): return int(obj)
@@ -67,6 +70,13 @@ def _to_python(obj):
     if isinstance(obj, dict): return {k: _to_python(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)): return [_to_python(v) for v in obj]
     return obj
+
+def _get_trainer(persona_key: str) -> PersonalTrainer:
+    """Return the persona-specific trainer, falling back to the single trained model."""
+    t = _state["persona_trainers"].get(persona_key) or _state.get("trainer")
+    if t is None:
+        raise HTTPException(400, "No trained model available. Train models first.")
+    return t
 
 # ── Personas & features ────────────────────────────────────────────────────────
 @app.get("/api/personas")
@@ -80,12 +90,14 @@ def get_features():
 @app.get("/api/state")
 def get_app_state():
     return {
-        "has_data": _state["persona_data"] is not None,
-        "has_models": _state["trainer"] is not None,
-        "has_simulation": _state["sim_th"] is not None,
-        "has_multiseed": _state["multi_seed_df"] is not None,
-        "has_crossuser": _state["cross_user_results"] is not None,
-        "active_persona": _state["active_persona"],
+        "has_data":          _state["persona_data"] is not None,
+        "has_models":        bool(_state["persona_trainers"]) or _state["trainer"] is not None,
+        "has_persona_models": bool(_state["persona_trainers"]),
+        "trained_personas":  list(_state["persona_trainers"].keys()),
+        "has_simulation":    _state["sim_th"] is not None,
+        "has_multiseed":     _state["multi_seed_df"] is not None,
+        "has_crossuser":     _state["cross_user_results"] is not None,
+        "active_persona":    _state["active_persona"],
     }
 
 # ── Jobs ───────────────────────────────────────────────────────────────────────
@@ -111,9 +123,11 @@ def generate_data(req: GenerateDataReq):
                 n_sessions=req.n_sessions, session_duration=req.session_duration, seed=req.seed,
             )
             _state["persona_data"] = data
-            for k in ["trainer", "baseline_clf", "ts", "sim_rule", "sim_th",
-                      "sim_ml", "ml_preds", "multi_seed_df", "cross_user_results"]:
-                _state[k] = None
+            # Reset downstream state
+            for k in ["trainer", "baseline_clf", "persona_trainers", "persona_metrics",
+                      "ts", "sim_rule", "sim_th", "sim_ml", "ml_preds",
+                      "multi_seed_df", "cross_user_results"]:
+                _state[k] = {} if k in ("persona_trainers", "persona_metrics") else None
             _finish_job(jid, {"n_total": sum(len(d) for d in data.values()), "n_users": len(PERSONAS)})
         except Exception as e:
             _fail_job(jid, str(e))
@@ -144,8 +158,8 @@ def chart_distribution(persona_key: str, feature: str = "throughput_dl"):
     )
     fig = px.histogram(combined, x=feature, color="persona_name", barmode="overlay",
                        opacity=0.65, nbins=60,
-                       title=f"{feature.replace('_', ' ').title()} — all personas overlaid")
-    fig.update_layout(height=360, legend_title="Persona")
+                       title=f"{feature.replace('_', ' ').title()} — all personas")
+    fig.update_layout(height=320, legend_title="Persona", margin=dict(t=40, b=20))
     return _fig_json(fig)
 
 @app.get("/api/data/{persona_key}/charts/pies")
@@ -158,12 +172,12 @@ def chart_pies(persona_key: str):
     loc = df["location"].value_counts()
     cls = df["congestion_true"].value_counts()
     fig_loc = px.pie(values=loc.values.tolist(), names=loc.index.tolist(), title="Time at each location")
-    fig_loc.update_layout(height=300)
+    fig_loc.update_layout(height=280, margin=dict(t=40, b=10))
     fig_cls = px.pie(values=cls.values.tolist(), names=cls.index.tolist(),
                      color=cls.index.tolist(),
-                     color_discrete_map={"low": "#2ca02c", "medium": "#ff7f0e", "high": "#d62728"},
-                     title="Congestion class distribution")
-    fig_cls.update_layout(height=300)
+                     color_discrete_map={"low": "#4ade80", "medium": "#fb923c", "high": "#f87171"},
+                     title="Congestion distribution")
+    fig_cls.update_layout(height=280, margin=dict(t=40, b=10))
     return {"location": _fig_json(fig_loc), "congestion": _fig_json(fig_cls)}
 
 @app.get("/api/data/{persona_key}/charts/scatter")
@@ -177,12 +191,12 @@ def chart_scatter(persona_key: str, features: str = "throughput_dl,latency,signa
         raise HTTPException(400, "Need at least 2 valid features")
     sample = pds[persona_key].sample(min(500, len(pds[persona_key])), random_state=1)
     fig = px.scatter_matrix(sample, dimensions=feat_list, color="congestion_true",
-                            color_discrete_map={"low": "#2ca02c", "medium": "#ff7f0e", "high": "#d62728"})
+                            color_discrete_map={"low": "#4ade80", "medium": "#fb923c", "high": "#f87171"})
     fig.update_traces(diagonal_visible=False, marker_size=3)
-    fig.update_layout(height=560)
+    fig.update_layout(height=520, margin=dict(t=20, b=20))
     return _fig_json(fig)
 
-# ── Model training ─────────────────────────────────────────────────────────────
+# ── Model training — single persona (legacy) ────────────────────────────────────
 class TrainReq(BaseModel):
     persona_key: str
     lstm_window: int = 15
@@ -214,6 +228,127 @@ def train_models(req: TrainReq):
             _fail_job(jid, str(e))
     threading.Thread(target=run, daemon=True).start()
     return {"job_id": jid}
+
+# ── Model training — all personas ───────────────────────────────────────────────
+class TrainAllReq(BaseModel):
+    lstm_window: int = 15
+    lstm_epochs: int = 25
+    lstm_patience: int = 7
+    knn_k: int = 5
+    rf_trees: int = 100
+
+@app.post("/api/models/train-all")
+def train_all_personas(req: TrainAllReq):
+    pds = _require("persona_data", "Persona data")
+    jid = _new_job()
+    def run():
+        try:
+            n = len(pds)
+            new_trainers: dict = {}
+            new_metrics: dict = {}
+            for i, (persona_key, df) in enumerate(pds.items()):
+                trainer = PersonalTrainer(
+                    window=req.lstm_window, epochs=req.lstm_epochs, patience=req.lstm_patience
+                )
+                trainer.fit(df)
+                m = trainer.evaluate(df)
+                new_trainers[persona_key] = trainer
+                new_metrics[persona_key] = {
+                    "accuracy":      float(m["accuracy"]),
+                    "f1_macro":      float(m["f1_macro"]),
+                    "epochs_trained": len(trainer.train_losses),
+                    "confusion_matrix": m["confusion_matrix"].tolist(),
+                    "class_names":   m["class_names"],
+                    "train_losses":  trainer.train_losses,
+                    "val_losses":    trainer.val_losses,
+                }
+                _jobs[jid]["progress"] = (i + 1) / n
+
+            _state["persona_trainers"] = new_trainers
+            _state["persona_metrics"]  = new_metrics
+
+            # Train combined baseline on all data for comparison
+            all_data = pd.concat(list(pds.values()), ignore_index=True)
+            clf = NetworkClassifier(knn_k=req.knn_k, rf_trees=req.rf_trees)
+            clf.train(all_data)
+            _state["baseline_clf"] = clf
+
+            # Set fallback single trainer to first persona
+            first_key = list(pds.keys())[0]
+            _state["trainer"]        = new_trainers[first_key]
+            _state["active_persona"] = first_key
+
+            for k in ["ts", "sim_rule", "sim_th", "sim_ml", "ml_preds", "multi_seed_df"]:
+                _state[k] = None
+
+            _finish_job(jid, {"n_personas": n})
+        except Exception as e:
+            _fail_job(jid, str(e))
+    threading.Thread(target=run, daemon=True).start()
+    return {"job_id": jid}
+
+@app.get("/api/models/all-metrics")
+def get_all_persona_metrics():
+    pm = _state.get("persona_metrics") or {}
+    if not pm:
+        raise HTTPException(400, "No persona models trained yet.")
+    clf = _state.get("baseline_clf")
+    personas_out = {
+        key: {
+            "persona_name":  PERSONAS[key].name,
+            "accuracy":      m["accuracy"],
+            "f1_macro":      m["f1_macro"],
+            "epochs_trained": m["epochs_trained"],
+        }
+        for key, m in pm.items()
+    }
+    baseline_out = {}
+    feature_importance: dict = {}
+    if clf:
+        for name, r in clf.results.items():
+            baseline_out[name] = {"accuracy": r["accuracy"], "f1_macro": r["f1_macro"]}
+        feature_importance = clf.feature_importances_
+    return _to_python({
+        "personas":           personas_out,
+        "baselines":          baseline_out,
+        "feature_importance": feature_importance,
+    })
+
+@app.get("/api/models/{persona_key}/charts/loss")
+def chart_persona_loss(persona_key: str):
+    import plotly.express as px
+    pm = _state.get("persona_metrics") or {}
+    if persona_key not in pm:
+        raise HTTPException(404, f"No model trained for {persona_key}")
+    m = pm[persona_key]
+    curve_df = pd.DataFrame({
+        "epoch": list(range(1, len(m["train_losses"]) + 1)),
+        "Train": m["train_losses"],
+        "Val":   m["val_losses"],
+    })
+    fig = px.line(
+        curve_df.melt("epoch", var_name="Split", value_name="Loss"),
+        x="epoch", y="Loss", color="Split", title="Training loss",
+    )
+    fig.update_layout(height=240, margin=dict(t=30, b=20, l=40, r=10))
+    return _fig_json(fig)
+
+@app.get("/api/models/{persona_key}/charts/confusion")
+def chart_persona_confusion(persona_key: str):
+    import plotly.express as px
+    pm = _state.get("persona_metrics") or {}
+    if persona_key not in pm:
+        raise HTTPException(404, f"No model trained for {persona_key}")
+    m = pm[persona_key]
+    fig = px.imshow(
+        m["confusion_matrix"], text_auto=True,
+        x=m["class_names"], y=m["class_names"],
+        color_continuous_scale="Blues",
+        labels={"x": "Predicted", "y": "Actual"},
+        title="Confusion Matrix",
+    )
+    fig.update_layout(height=240, margin=dict(t=30, b=20, l=50, r=10), coloraxis_showscale=False)
+    return _fig_json(fig)
 
 @app.get("/api/models/metrics")
 def get_model_metrics():
@@ -286,21 +421,21 @@ class SimReq(BaseModel):
 
 @app.post("/api/simulation/run")
 def run_simulation(req: SimReq):
-    trainer = _require("trainer", "Trained models")
+    trainer = _get_trainer(req.persona_key)
     gen = PersonaDataGenerator()
     ts = gen.generate_streaming_trace(req.persona_key, duration=req.duration,
                                       hour_of_day=req.hour, seed=req.seed)
     preds = trainer.predict_series(ts)
     engine = StreamingEngine()
     sim_rule = engine.simulate(ts, method="rule")
-    sim_th = engine.simulate(ts, method="threshold")
-    sim_ml = engine.simulate(ts, method="ml", predictions=preds)
+    sim_th   = engine.simulate(ts, method="threshold")
+    sim_ml   = engine.simulate(ts, method="ml", predictions=preds)
     _state.update(ts=ts, sim_rule=sim_rule, sim_th=sim_th, sim_ml=sim_ml,
                   ml_preds=preds, multi_seed_df=None)
     return _to_python({
-        "rule": compute_metrics(sim_rule),
+        "rule":      compute_metrics(sim_rule),
         "threshold": compute_metrics(sim_th),
-        "ml": compute_metrics(sim_ml),
+        "ml":        compute_metrics(sim_ml),
     })
 
 @app.get("/api/simulation/charts")
@@ -309,10 +444,10 @@ def get_simulation_charts():
     ts = _state["ts"]
     sr, st, sm = _state["sim_rule"], _state["sim_th"], _state["sim_ml"]
     return {
-        "throughput": _fig_json(plot_throughput(ts)),
-        "estimator": _fig_json(plot_estimator(st, sm, sr)),
+        "throughput":       _fig_json(plot_throughput(ts)),
+        "estimator":        _fig_json(plot_estimator(st, sm, sr)),
         "quality_timeline": _fig_json(plot_quality_timeline(st, sm, sr)),
-        "buffer": _fig_json(plot_buffer(st, sm, sr)),
+        "buffer":           _fig_json(plot_buffer(st, sm, sr)),
     }
 
 # ── Comparison ─────────────────────────────────────────────────────────────────
@@ -321,8 +456,8 @@ def get_comparison_data():
     _require("sim_th", "Simulation")
     metrics = compare(_state["sim_th"], _state["sim_ml"], _state["sim_rule"])
     return {
-        "metrics": _to_python(metrics),
-        "bars": _fig_json(plot_comparison_bars(metrics)),
+        "metrics":      _to_python(metrics),
+        "bars":         _fig_json(plot_comparison_bars(metrics)),
         "distribution": _fig_json(plot_quality_distribution(metrics)),
     }
 
@@ -334,7 +469,7 @@ class MultiSeedReq(BaseModel):
 
 @app.post("/api/multiseed/run")
 def run_multiseed(req: MultiSeedReq):
-    trainer = _require("trainer", "Trained models")
+    trainer = _get_trainer(req.persona_key)
     jid = _new_job()
     def run():
         try:
@@ -353,9 +488,9 @@ def get_multiseed_data(metric: str = "qoe_score", baseline: str = "Rule-Based"):
     df_runs = _require("multi_seed_df", "Multi-seed analysis")
     win_rates = compute_win_rates(df_runs, baseline=baseline)
     return {
-        "bars": _fig_json(plot_multi_seed_bars(df_runs)),
+        "bars":         _fig_json(plot_multi_seed_bars(df_runs)),
         "distribution": _fig_json(plot_multi_seed_distribution(df_runs, metric)),
-        "win_rates": _to_python(win_rates.to_dict(orient="records")),
+        "win_rates":    _to_python(win_rates.to_dict(orient="records")),
     }
 
 # ── Cross-user ─────────────────────────────────────────────────────────────────
@@ -385,21 +520,22 @@ def get_crossuser_data():
     import plotly.express as px
     res = _require("cross_user_results", "Cross-user results")
     fig = px.bar(res, x="persona_name", y=["personal_acc", "generic_acc"], barmode="group",
-                 color_discrete_map={"personal_acc": "#a6e3a1", "generic_acc": "#f38ba8"},
+                 color_discrete_map={"personal_acc": "#4ade80", "generic_acc": "#f87171"},
                  labels={"value": "Accuracy", "persona_name": "Persona", "variable": "Model"},
                  title="Personal vs Generic Accuracy per User")
     fig.for_each_trace(lambda t: t.update(name="Personal" if t.name == "personal_acc" else "Generic"))
-    fig.update_layout(height=380, xaxis_tickangle=-15, legend_title="Model")
+    fig.update_layout(height=360, xaxis_tickangle=-15, legend_title="Model", margin=dict(t=40, b=20))
     cols = ["persona_name", "personal_acc", "generic_acc", "delta_acc",
             "personal_f1", "generic_f1", "delta_f1"]
     table = res[cols].rename(columns={
         "persona_name": "Persona", "personal_acc": "Personal Acc", "generic_acc": "Generic Acc",
-        "delta_acc": "Δ Acc", "personal_f1": "Personal F1", "generic_f1": "Generic F1", "delta_f1": "Δ F1",
+        "delta_acc": "Delta Acc", "personal_f1": "Personal F1",
+        "generic_f1": "Generic F1", "delta_f1": "Delta F1",
     }).to_dict(orient="records")
     return _to_python({
-        "table": table,
+        "table":          table,
         "mean_delta_acc": float(res["delta_acc"].mean()),
-        "personal_wins": int((res["delta_acc"] > 0).sum()),
+        "personal_wins":  int((res["delta_acc"] > 0).sum()),
         "total_personas": len(res),
-        "chart": _fig_json(fig),
+        "chart":          _fig_json(fig),
     })
