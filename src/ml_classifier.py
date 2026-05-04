@@ -9,11 +9,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
+from src.personal_model import CLASSES, _compute_labels
+
 FEATURES = [
     'throughput_dl', 'throughput_ul', 'latency',
     'packet_loss', 'jitter', 'signal_strength', 'mobility_speed'
 ]
-CLASSES = ['low', 'medium', 'high']
 
 
 class NetworkClassifier:
@@ -36,12 +37,11 @@ class NetworkClassifier:
         self.results: dict = {}
         self._trained = False
 
-    def _label_col(self, df: pd.DataFrame) -> str:
-        return 'congestion_true' if 'congestion_true' in df.columns else 'congestion'
-
-    def prepare_data(self, df: pd.DataFrame, test_size: float = 0.2):
+    def prepare_data(self, df: pd.DataFrame, test_size: float = 0.2, horizon: int = 5):
         X = df[FEATURES].values
-        y = self.le.transform(df[self._label_col(df)].values)
+        # Predict the sustained quality over the next `horizon` steps
+        raw_labels = _compute_labels(df['throughput_dl'].values, horizon)
+        y = self.le.transform(raw_labels)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=self.random_state, stratify=y
         )
