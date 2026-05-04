@@ -240,7 +240,11 @@ class PersonalTrainer:
         # causing training instability.  Square-root weighting gently up-weights
         # minority classes (e.g. 'low' congestion in rural personas) without
         # letting rare-class loss dominate the gradient signal.
-        cw = compute_class_weight('balanced', classes=np.unique(y_raw), y=y_raw)
+        present = np.unique(y_raw)
+        cw_present = compute_class_weight('balanced', classes=present, y=y_raw)
+        cw = np.ones(len(CLASSES), dtype=np.float64)
+        for cls_id, w in zip(present, cw_present):
+            cw[cls_id] = w
         cw = np.sqrt(cw)
         cw = (cw / cw.mean()).astype(np.float32)
         cw_tensor = torch.FloatTensor(cw).to(self.device)
