@@ -205,9 +205,12 @@ class PersonalTrainer:
         n         = len(X_raw)
         val_start = int(n * (1.0 - val_frac))
 
-        X_train = self.scaler.fit_transform(X_raw[:val_start])
+        # Prevent data leakage: drop the last `horizon` steps from train 
+        # so they don't look ahead into the validation throughputs
+        X_train = self.scaler.fit_transform(X_raw[:val_start - self.horizon])
         X_val   = self.scaler.transform(X_raw[val_start:])
-        y_train, y_val = y_raw[:val_start], y_raw[val_start:]
+        y_train = y_raw[:val_start - self.horizon]
+        y_val   = y_raw[val_start:]
 
         Xs_tr, ys_tr = self._make_sequences(X_train, y_train)
         Xs_va, ys_va = self._make_sequences(X_val,   y_val)
